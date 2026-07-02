@@ -1,0 +1,29 @@
+customer_name: Example Customer
+api_id: REPLACE_ME
+api_key: REPLACE_ME
+
+# Optional explicit product override.
+# If omitted, the tool probes product-specific APIs and combines that with org/policy signals.
+# Valid products: NGAV, EEDR, Live Query, XDR, Vulnerability Management, HBFW, Workloads
+# products:
+#   - EEDR
+#   - Live Query
+
+# Optional. If omitted, the tool auto-discovers a working backend URL.
+backend_url: null
+
+# Optional. If known, provide tenant identifiers. If omitted, tool discovers from API.
+tenant_id: null
+tenant_key: null
+
+output_dir: output
+verify_tls: true
+timeout_seconds: 30
+assessment_profile: prod
+
+# Optional SOC/alert-volume tuning for recommendation logic.
+# If soc_analysts is null, the tool estimates a team size from active endpoints.
+soc_analysts: null
+alerts_per_analyst_per_shift: 80
+alert_volume_avg_daily_threshold: 1000
+alert_volume_peak_daily_threshold: 1500

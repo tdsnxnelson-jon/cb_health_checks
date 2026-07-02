@@ -1,0 +1,17 @@
+{
+  "customer_name": "Example Customer",
+  "api_id": "REPLACE_ME",
+  "api_key": "REPLACE_ME",
+  "products": null,
+  "backend_url": null,
+  "tenant_id": null,
+  "tenant_key": null,
+  "output_dir": "output",
+  "verify_tls": true,
+  "timeout_seconds": 30,
+  "assessment_profile": "prod",
+  "soc_analysts": null,
+  "alerts_per_analyst_per_shift": 80,
+  "alert_volume_avg_daily_threshold": 1000,
+  "alert_volume_peak_daily_threshold": 1500
+}

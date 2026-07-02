@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Editor/OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Requested exclusions
+cbc_health_cli/creds/
+cbc_health_cli/output/
+symhealth_app/
+symhealth_app.tar
+SymHealth Health Check.pdf
