@@ -960,8 +960,37 @@ def _enrich_ips(ips: list[str]) -> dict[str, dict[str, str | None]]:
 
 def summarize_api_connector_use(
     audit_logs: list[dict[str, Any]],
+    api_access_keys: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    api_access_keys = api_access_keys or []
+
+    api_access_type_by_id: dict[str, str] = {}
+    for key in api_access_keys:
+        if not isinstance(key, dict):
+            continue
+        api_id = str(_pick_value(key, ["api_id", "apiId", "id", "key_id", "connector_id"], "")).strip()
+        if not api_id:
+            continue
+        access_level_type = str(
+            _pick_value(
+                key,
+                [
+                    "access_level_type",
+                    "accessLevelType",
+                    "access_level_name",
+                    "accessLevelName",
+                    "access_level",
+                    "accessLevel",
+                    "role",
+                ],
+                "unknown",
+            )
+        ).strip() or "unknown"
+        api_access_type_by_id[api_id] = access_level_type
+
     connector_sessions: Counter[str] = Counter()
+    access_type_counter: Counter[str] = Counter()
+    connector_access_type_counter: dict[str, Counter[str]] = defaultdict(Counter)
     ip_counter: Counter[str] = Counter()
     connector_events: list[dict[str, Any]] = []
 
@@ -973,6 +1002,11 @@ def summarize_api_connector_use(
 
         connector_id = str(_pick_value(event, ["actor", "api_key_id", "access_key", "principal"], "unknown")).strip()
         connector_sessions[connector_id] += 1
+        access_level_type = api_access_type_by_id.get(connector_id, "")
+        if not access_level_type:
+            access_level_type = "unknown"
+        access_type_counter[access_level_type] += 1
+        connector_access_type_counter[connector_id][access_level_type] += 1
 
         # Audit log v1 uses actor_ip, not ip_address/source_ip
         ip = str(_pick_value(event, ["actor_ip", "ip_address", "source_ip", "client_ip"], "unknown")).strip()
@@ -981,6 +1015,7 @@ def summarize_api_connector_use(
 
         connector_events.append({
             "connector_id": connector_id,
+            "api_access_level_type": access_level_type,
             "description": description,
             "actor_ip": ip,
             "create_time": event.get("create_time", ""),
@@ -992,11 +1027,20 @@ def summarize_api_connector_use(
         "total_audit_events": len(audit_logs),
         "connector_session_events": len(connector_events),
         "active_connectors": [
-            {"connector_id": cid, "session_count": count}
+            {
+                "connector_id": cid,
+                "api_access_level_type": (
+                    connector_access_type_counter[cid].most_common(1)[0][0]
+                    if connector_access_type_counter.get(cid)
+                    else "unknown"
+                ),
+                "session_count": count,
+            }
             for cid, count in connector_sessions.most_common()
             if cid != "unknown"
         ],
         "active_connector_count": len([k for k in connector_sessions if k != "unknown"]),
+        "api_access_level_type_breakdown": dict(access_type_counter.most_common()),
         "unique_source_ips": len(ip_counter),
         "top_source_ips": _build_enriched_ip_list(ip_counter),
         "dormant_integrations": dormant_entities[:50],
@@ -1226,10 +1270,71 @@ def summarize_daily_alert_trends(alerts: list[dict[str, Any]]) -> dict[str, Any]
 
 
 def summarize_user_logins(audit_logs: list[dict[str, Any]]) -> dict[str, Any]:
-    return summarize_user_logins_with_users(audit_logs, [])
+    return summarize_user_logins_with_users(audit_logs, [], [])
 
 
-def summarize_user_logins_with_users(audit_logs: list[dict[str, Any]], users: list[dict[str, Any]]) -> dict[str, Any]:
+def _normalize_role_name(role_value: str) -> str:
+    raw = str(role_value or "").strip()
+    if not raw:
+        return "unknown"
+
+    if raw.lower() == "deprecated":
+        return "unknown"
+
+    token = raw.split(":")[-1]
+    token = token.replace("_ROLE", "")
+
+    known = {
+        "BETA_SUPER_ADMIN": "Super Admin",
+        "BETA_LEVEL_1_ANALYST": "Level 1 Analyst",
+        "BETA_LEVEL_2_ANALYST": "Level 2 Analyst",
+        "BETA_LEVEL_3_ANALYST": "Level 3 Analyst",
+        "SUPER_ADMIN": "Super Admin",
+        "LEVEL_1_ANALYST": "Level 1 Analyst",
+        "LEVEL_2_ANALYST": "Level 2 Analyst",
+        "LEVEL_3_ANALYST": "Level 3 Analyst",
+        "MANAGE_ANALYST_1": "Level 1 Analyst",
+        "MANAGE_ANALYST_2": "Level 2 Analyst",
+        "MANAGE_ANALYST_3": "Level 3 Analyst",
+        "LEVEL_1_ANALYST_WITH_MANAGE_USERS": "Level 1 Analyst",
+        "LEVEL_2_ANALYST_WITH_MANAGE_USERS": "Level 2 Analyst",
+        "LEVEL_3_ANALYST_WITH_MANAGE_USERS": "Level 3 Analyst",
+    }
+    if token in known:
+        return known[token]
+
+    if "SUPER" in token and "ADMIN" in token:
+        return "Super Admin"
+
+    readable = token.replace("_", " ").strip()
+    return readable.title() if readable else "unknown"
+
+
+def _roles_from_grant(grant: dict[str, Any]) -> list[str]:
+    roles: list[str] = []
+    direct_roles = grant.get("roles")
+    if isinstance(direct_roles, list):
+        roles.extend(str(item) for item in direct_roles if str(item).strip())
+
+    profiles = grant.get("profiles")
+    if isinstance(profiles, list):
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            profile_roles = profile.get("roles")
+            if isinstance(profile_roles, list):
+                roles.extend(str(item) for item in profile_roles if str(item).strip())
+
+    deduped = list(dict.fromkeys(roles))
+    return deduped
+
+
+def summarize_user_logins_with_users(
+    audit_logs: list[dict[str, Any]],
+    users: list[dict[str, Any]],
+    user_grants: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    user_grants = user_grants or []
     now = datetime.now(timezone.utc)
     last_login_by_user: dict[str, datetime] = {}
     last_login_ip_by_user: dict[str, str] = {}
@@ -1267,10 +1372,67 @@ def summarize_user_logins_with_users(audit_logs: list[dict[str, Any]], users: li
                 last_login_ip_by_user[user] = ip
 
     known_users: set[str] = set()
+    user_role_by_identifier: dict[str, str] = {}
+
+    def _set_role(identifier: str, role: str) -> None:
+        key = str(identifier or "").strip()
+        if not key:
+            return
+        existing = user_role_by_identifier.get(key)
+        if existing in (None, "", "unknown") and role:
+            user_role_by_identifier[key] = role
+        lower_key = key.lower()
+        existing_lower = user_role_by_identifier.get(lower_key)
+        if existing_lower in (None, "", "unknown") and role:
+            user_role_by_identifier[lower_key] = role
+
+    # Prefer grants for role assignment because role placement differs by tenant
+    # (grant.roles vs grant.profiles[].roles).
+    for grant in user_grants:
+        if not isinstance(grant, dict):
+            continue
+        grant_roles = _roles_from_grant(grant)
+        if not grant_roles:
+            continue
+        normalized_roles = [_normalize_role_name(role) for role in grant_roles]
+        # Keep first role; CBC grants are commonly single-role per principal.
+        role_name = normalized_roles[0] if normalized_roles else "unknown"
+
+        principal_name = str(_pick_value(grant, ["principal_name", "principalName", "email", "username"], "")).strip()
+        if principal_name:
+            _set_role(principal_name, role_name)
+
+        principal = str(grant.get("principal", "")).strip()
+        if principal.startswith("psc:user:"):
+            principal_id = principal.split(":")[-1]
+            if principal_id:
+                _set_role(principal_id, role_name)
+
     for user in users:
-        known_user = str(_pick_value(user, ["email", "username", "user_name", "login", "name"], "")).strip()
-        if known_user:
-            known_users.add(known_user)
+        role = str(_pick_value(user, ["role", "user_role", "access_role"], "unknown")).strip() or "unknown"
+        normalized_user_role = _normalize_role_name(role)
+        canonical_user = str(
+            _pick_value(user, ["login_name", "email", "username", "user_name", "login", "name"], "")
+        ).strip()
+        if canonical_user:
+            known_users.add(canonical_user)
+
+        for key in ["login_name", "email", "username", "user_name", "login", "name", "login_id", "contact_id"]:
+            identifier = str(_pick_value(user, [key], "")).strip()
+            if not identifier:
+                continue
+            _set_role(identifier, normalized_user_role)
+
+        login_id = str(_pick_value(user, ["login_id"], "")).strip()
+        if canonical_user and login_id:
+            # Login events sometimes resolve to numeric login IDs.
+            _set_role(canonical_user, user_role_by_identifier.get(login_id, normalized_user_role))
+
+    def _user_role(user_name: str) -> str:
+        direct = user_role_by_identifier.get(user_name)
+        if direct not in (None, ""):
+            return str(direct)
+        return str(user_role_by_identifier.get(str(user_name).lower(), "unknown"))
 
     users_to_evaluate = known_users if known_users else set(last_login_by_user.keys())
 
@@ -1299,6 +1461,7 @@ def summarize_user_logins_with_users(audit_logs: list[dict[str, Any]], users: li
         user_login_details.append(
             {
                 "user": user,
+                "role": _user_role(user),
                 "last_login": last_login_by_user[user].isoformat(),
                 "last_login_ip": last_login_ip_by_user.get(user, "unknown"),
                 "login_count": int(login_count_by_user.get(user, 0)),
@@ -1306,15 +1469,26 @@ def summarize_user_logins_with_users(audit_logs: list[dict[str, Any]], users: li
             }
         )
 
+    dormant_7_sorted = sorted(dormant_7)
+    dormant_30_sorted = sorted(dormant_30)
+    dormant_60_sorted = sorted(dormant_60)
+    never_logged_in_sorted = sorted(never_logged_in)
+
     return {
         "total_users": len(users_to_evaluate),
         "users_with_login_events": len(last_login_by_user),
-        "users_without_login_events": sorted(never_logged_in),
+        "users_without_login_events": never_logged_in_sorted,
+        "users_without_login_events_details": [
+            {"user": user, "role": _user_role(user)} for user in never_logged_in_sorted
+        ],
         "users_without_login_events_count": len(never_logged_in),
         "user_login_details": user_login_details,
-        "dormant_over_7d": sorted(dormant_7),
-        "dormant_over_30d": sorted(dormant_30),
-        "dormant_over_60d": sorted(dormant_60),
+        "dormant_over_7d": dormant_7_sorted,
+        "dormant_over_30d": dormant_30_sorted,
+        "dormant_over_60d": dormant_60_sorted,
+        "dormant_over_7d_details": [{"user": user, "role": _user_role(user)} for user in dormant_7_sorted],
+        "dormant_over_30d_details": [{"user": user, "role": _user_role(user)} for user in dormant_30_sorted],
+        "dormant_over_60d_details": [{"user": user, "role": _user_role(user)} for user in dormant_60_sorted],
         "dormant_over_7d_count": len(dormant_7),
         "dormant_over_30d_count": len(dormant_30),
         "dormant_over_60d_count": len(dormant_60),
@@ -1803,9 +1977,19 @@ def prioritized_recommendations(summary: dict[str, Any]) -> list[dict[str, str]]
     dormant_60d_count = int(user_logins.get("dormant_over_60d_count", 0))
     dormant_30d_count = int(user_logins.get("dormant_over_30d_count", 0))
     if dormant_60d_count > 0:
-        users = user_logins.get("dormant_over_60d", [])
-        names = users[:5] if isinstance(users, list) else []
-        names_str = ", ".join(names) + (" ..." if isinstance(users, list) and len(users) > 5 else "")
+        user_details = user_logins.get("dormant_over_60d_details", [])
+        if isinstance(user_details, list) and user_details:
+            sample_details = user_details[:5]
+            names = [
+                f"{str(item.get('user', 'unknown'))} ({str(item.get('role', 'unknown'))})"
+                for item in sample_details
+                if isinstance(item, dict)
+            ]
+            names_str = ", ".join(names) + (" ..." if len(user_details) > 5 else "")
+        else:
+            users = user_logins.get("dormant_over_60d", [])
+            names = users[:5] if isinstance(users, list) else []
+            names_str = ", ".join(names) + (" ..." if isinstance(users, list) and len(users) > 5 else "")
         recs.append(
             {
                 "priority": "P1",
@@ -1815,9 +1999,19 @@ def prioritized_recommendations(summary: dict[str, Any]) -> list[dict[str, str]]
             }
         )
     elif dormant_30d_count > 0:
-        users = user_logins.get("dormant_over_30d", [])
-        names = users[:5] if isinstance(users, list) else []
-        names_str = ", ".join(names) + (" ..." if isinstance(users, list) and len(users) > 5 else "")
+        user_details = user_logins.get("dormant_over_30d_details", [])
+        if isinstance(user_details, list) and user_details:
+            sample_details = user_details[:5]
+            names = [
+                f"{str(item.get('user', 'unknown'))} ({str(item.get('role', 'unknown'))})"
+                for item in sample_details
+                if isinstance(item, dict)
+            ]
+            names_str = ", ".join(names) + (" ..." if len(user_details) > 5 else "")
+        else:
+            users = user_logins.get("dormant_over_30d", [])
+            names = users[:5] if isinstance(users, list) else []
+            names_str = ", ".join(names) + (" ..." if isinstance(users, list) and len(users) > 5 else "")
         recs.append(
             {
                 "priority": "P2",

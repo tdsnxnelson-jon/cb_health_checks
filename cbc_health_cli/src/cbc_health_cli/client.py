@@ -3,6 +3,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from urllib3.exceptions import InsecureRequestWarning
@@ -517,6 +518,201 @@ class CBCClient:
 
         if last_error:
             raise RuntimeError(f"Unable to fetch users: {last_error}") from last_error
+        return []
+
+    def get_user_grants(
+        self,
+        backend_url: str,
+        tenant_key: str,
+        tenant_id: str | None = None,
+        users: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch grants for users. Some tenants store roles on grant.roles and others on grant.profiles[].roles."""
+        normalized_backend = backend_url.rstrip("/")
+        users = users or []
+
+        principal_urns: list[str] = []
+        for user in users:
+            if not isinstance(user, dict):
+                continue
+            # Access v2 grants identify users by login_id, not contact_id.
+            login_id = str(user.get("login_id", "")).strip()
+            if login_id:
+                principal_urns.append(f"psc:user:{tenant_key}:{login_id}")
+
+        principal_urns = list(dict.fromkeys(principal_urns))[:5000]
+
+        org_refs = [tenant_key]
+        if tenant_id:
+            org_refs.append(str(tenant_id))
+
+        last_error: Exception | None = None
+        grants: list[dict[str, Any]] = []
+        for org_ref in org_refs:
+            for principal in principal_urns:
+                encoded_principal = quote(principal, safe=":")
+                url = f"{normalized_backend}/access/v2/orgs/{org_ref}/grants/{encoded_principal}"
+                try:
+                    data = self._get(url).json()
+                    if isinstance(data, dict) and data.get("principal"):
+                        grants.append(data)
+                except Exception as exc:
+                    last_error = exc
+
+        if grants:
+            return grants
+
+        if last_error:
+            raise RuntimeError(f"Unable to fetch user grants: {last_error}") from last_error
+        return []
+
+    @staticmethod
+    def _access_role_display(role_urn: str, role_name_by_urn: dict[str, str]) -> str:
+        role_urn = str(role_urn or "").strip()
+        if not role_urn:
+            return "unknown"
+        if role_urn in role_name_by_urn:
+            return role_name_by_urn[role_urn]
+        token = role_urn.split(":")[-1].replace("_ROLE", "")
+        normalized = token.upper()
+        known = {
+            "BETA_VIEW_ALL": "View All",
+            "BETA_SUPER_ADMIN": "Super Admin",
+            "BETA_LEVEL_1_ANALYST": "Level 1 Analyst",
+            "BETA_LEVEL_2_ANALYST": "Level 2 Analyst",
+            "BETA_LEVEL_3_ANALYST": "Level 3 Analyst",
+            "VIEW_ALL": "View All",
+            "SUPER_ADMIN": "Super Admin",
+            "LEVEL_1_ANALYST": "Level 1 Analyst",
+            "LEVEL_2_ANALYST": "Level 2 Analyst",
+            "LEVEL_3_ANALYST": "Level 3 Analyst",
+            "API_DEMO": "API Demo",
+            "HEALTH_CHECKS": "Health Checks",
+        }
+        if normalized in known:
+            return known[normalized]
+        return token.replace("_", " ").title() if token else "unknown"
+
+    def get_api_access_keys(
+        self,
+        backend_url: str,
+        tenant_key: str,
+        tenant_id: str | None = None,
+        connector_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch API connector IDs with authoritative access level type/name."""
+        normalized_backend = backend_url.rstrip("/")
+        org_refs = [tenant_key]
+        if tenant_id:
+            org_refs.append(str(tenant_id))
+
+        last_error: Exception | None = None
+        for org_ref in org_refs:
+            role_name_by_urn: dict[str, str] = {}
+
+            role_urls = [
+                f"{normalized_backend}/access/v2/orgs/{org_ref}/roles",
+                f"{normalized_backend}/appservices/v6/orgs/{org_ref}/roles",
+            ]
+            for role_url in role_urls:
+                try:
+                    role_data = self._get(role_url).json()
+                    role_rows = self._extract_list_payload(role_data)
+                    if role_rows:
+                        for row in role_rows:
+                            if not isinstance(row, dict):
+                                continue
+                            urn = str(row.get("role") or row.get("id") or row.get("urn") or "").strip()
+                            name = str(
+                                row.get("name")
+                                or row.get("display_name")
+                                or row.get("displayName")
+                                or row.get("description")
+                                or ""
+                            ).strip()
+                            if urn:
+                                role_name_by_urn[urn] = name or self._access_role_display(urn, {})
+                        break
+                except Exception as exc:
+                    last_error = exc
+
+            connector_ids = connector_ids or []
+            connector_ids = [str(item).strip() for item in connector_ids if str(item).strip()]
+            connector_ids = list(dict.fromkeys(connector_ids))
+
+            api_rows: list[dict[str, Any]] = []
+            for connector_id in connector_ids:
+                principal = f"psc:cnn:{tenant_key}:{connector_id}"
+                encoded_principal = quote(principal, safe=":")
+                grant_url = f"{normalized_backend}/access/v2/orgs/{org_ref}/grants/{encoded_principal}"
+                try:
+                    grant_data = self._get(grant_url).json()
+                    if not isinstance(grant_data, dict):
+                        continue
+
+                    role_urns: list[str] = []
+                    direct_roles = grant_data.get("roles")
+                    if isinstance(direct_roles, list):
+                        role_urns.extend(str(item) for item in direct_roles if str(item).strip())
+
+                    profiles = grant_data.get("profiles")
+                    if isinstance(profiles, list):
+                        for profile in profiles:
+                            if not isinstance(profile, dict):
+                                continue
+                            profile_roles = profile.get("roles")
+                            if isinstance(profile_roles, list):
+                                role_urns.extend(str(item) for item in profile_roles if str(item).strip())
+
+                    role_urns = list(dict.fromkeys(role_urns))
+                    access_level_type = (
+                        self._access_role_display(role_urns[0], role_name_by_urn)
+                        if role_urns
+                        else "unknown"
+                    )
+
+                    api_rows.append(
+                        {
+                            "api_id": connector_id,
+                            "access_level_type": access_level_type,
+                            "principal": principal,
+                            "role_urn": role_urns[0] if role_urns else "",
+                        }
+                    )
+                except Exception as exc:
+                    last_error = exc
+
+            if api_rows:
+                return api_rows
+
+        # Legacy raw endpoints fallback if access grants are unavailable.
+        urls: list[str] = []
+        for org_ref in org_refs:
+            urls.extend(
+                [
+                    f"{normalized_backend}/appservices/v6/orgs/{org_ref}/apiaccess/v1/keys",
+                    f"{normalized_backend}/appservices/v6/orgs/{org_ref}/api/access/v1/keys",
+                    f"{normalized_backend}/apiaccess/v1/orgs/{org_ref}/keys",
+                    f"{normalized_backend}/integrationServices/v3/orgs/{org_ref}/apiKeys",
+                    f"{normalized_backend}/integrationServices/v3/orgs/{org_ref}/apikeys",
+                    f"{normalized_backend}/integrationServices/v3/orgs/{org_ref}/keys",
+                    f"{normalized_backend}/appservices/v6/orgs/{org_ref}/apikeys",
+                    f"{normalized_backend}/appservices/v6/orgs/{org_ref}/api_keys",
+                    f"{normalized_backend}/appservices/v6/orgs/{org_ref}/api-access/keys",
+                ]
+            )
+
+        for url in urls:
+            try:
+                data = self._get(url).json()
+                rows = self._extract_list_payload(data)
+                if rows:
+                    return rows
+            except Exception as exc:
+                last_error = exc
+
+        if last_error:
+            raise RuntimeError(f"Unable to fetch API access keys: {last_error}") from last_error
         return []
 
     def get_org_entitlements(self, backend_url: str, tenant_key: str) -> dict[str, Any]:

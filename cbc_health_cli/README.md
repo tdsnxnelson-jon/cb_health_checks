@@ -49,20 +49,11 @@ Copy and edit [config.example.yaml](config.example.yaml), or create a JSON confi
 
 ## API Key Setup
 
-The API key used with this tool requires access to multiple Carbon Black Cloud endpoints. 
+**Required:** Use the built-in **"Super Admin"** role when creating the API key in Settings → API Access.
 
-**Recommended approach:** Use the built-in **"View All"** role when assigning the API key. This ensures access to all required endpoints, including legacy platform endpoints not fully documented in the RBAC system.
+Several checks depend on the CBC Access v2 grants API (`GET /access/v2/orgs/{org}/grants/{principal}`) to resolve user roles and API connector access level types. This endpoint is only accessible to Super Admin credentials. The "View All" built-in role and all custom access levels return 403 for connector principal lookups (`psc:cnn:*`), even though they can read user principal grants. The relevant permission is not exposed as a configurable capability in the Access Levels UI, so there is no way to grant it to a restricted key.
 
-**Alternative approach (custom access level):** If you require a more restrictive custom access level, ensure the following permissions are enabled with **READ** operations:
-- `device` – for device inventory
-- `org.alerts` – for alert data
-- `org.policies` – for policy and rule details
-- `org.audits` – for audit logs
-- `org.watchlists` – for threat watchlists
-- `org.reputations` – for reputation overrides
-- `org.info` – for organization metadata (required for org details endpoint)
-
-Note: The legacy `/appservices/v5/orgs/{id}/` endpoint used for organization metadata requires `org.info` permission in the custom access level, or the "View All" built-in role.
+If a non-Super Admin key is used, the tool will still run and produce output, but user roles and API connector access level types will show as `unknown` in the summary, slides, and recommendations.
 
 ## Run
 

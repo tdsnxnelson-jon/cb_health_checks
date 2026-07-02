@@ -322,6 +322,8 @@ def run_command(args: argparse.Namespace) -> int:
     ngav_enabled = True
 
     users: list[dict[str, Any]] = []
+    user_grants: list[dict[str, Any]] = []
+    api_access_keys: list[dict[str, Any]] = []
     reputation_overrides: list[dict[str, Any]] = []
     data_collection_configs: list[dict[str, Any]] = []
     org_info: dict[str, Any] = {}
@@ -536,7 +538,21 @@ def run_command(args: argparse.Namespace) -> int:
     status.advance("Starting API connector usage check")
 
     try:
-        connector_use = summarize_api_connector_use(audit_logs)
+        try:
+            connector_ids = sorted(
+                {
+                    str(event.get("actor", "")).strip()
+                    for event in audit_logs
+                    if isinstance(event, dict)
+                    and "connector" in str(event.get("description", "")).lower()
+                    and str(event.get("actor", "")).strip()
+                }
+            )
+            api_access_keys = client.get_api_access_keys(backend_url, tenant_key, tenant_id, connector_ids)
+        except Exception as exc:
+            summary["warnings"].append(f"api access keys API unavailable: {exc}")
+
+        connector_use = summarize_api_connector_use(audit_logs, api_access_keys)
         summary["checks"]["api_connector_use"] = {"status": "ok", "summary": connector_use}
     except Exception as exc:
         summary["checks"]["api_connector_use"] = {"status": "error"}
@@ -577,7 +593,12 @@ def run_command(args: argparse.Namespace) -> int:
     status.advance("Starting user logins check")
 
     try:
-        ul = summarize_user_logins_with_users(audit_logs, users)
+        try:
+            user_grants = client.get_user_grants(backend_url, tenant_key, tenant_id, users)
+        except Exception as exc:
+            summary["warnings"].append(f"user grants API unavailable: {exc}")
+
+        ul = summarize_user_logins_with_users(audit_logs, users, user_grants)
         summary["checks"]["user_logins"] = {"status": "ok", "summary": ul}
     except Exception as exc:
         summary["checks"]["user_logins"] = {"status": "error"}

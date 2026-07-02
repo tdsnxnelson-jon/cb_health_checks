@@ -1108,6 +1108,61 @@ def _add_sampling_footnote(slide, total: int, displayed: int, y_position: float 
     )
 
 
+def _dormant_recommendation_appendix_data(
+    recommendations: Any,
+    user_logins: dict[str, Any],
+    *,
+    displayed_names_in_evidence: int = 5,
+) -> tuple[list[list[Any]], list[str], int, int, str] | None:
+    if not isinstance(recommendations, list) or not isinstance(user_logins, dict):
+        return None
+
+    for rec in recommendations:
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("area", "")).strip().lower() != "user logins":
+            continue
+        evidence = str(rec.get("evidence", ""))
+        if "dormant_over_60d_count=" in evidence:
+            dormant_details = user_logins.get("dormant_over_60d_details", [])
+            if isinstance(dormant_details, list) and len(dormant_details) > displayed_names_in_evidence:
+                rows = [
+                    [
+                        "60d+",
+                        str(item.get("user", "unknown")) if isinstance(item, dict) else str(item),
+                        str(item.get("role", "unknown")) if isinstance(item, dict) else "unknown",
+                    ]
+                    for item in dormant_details
+                ]
+                return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_details), "Recommendation Dormant Users"
+
+            dormant_users = user_logins.get("dormant_over_60d", [])
+            if isinstance(dormant_users, list) and len(dormant_users) > displayed_names_in_evidence:
+                rows = [["60d+", user, "unknown"] for user in dormant_users]
+                return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_users), "Recommendation Dormant Users"
+            return None
+        if "dormant_over_30d_count=" in evidence:
+            dormant_details = user_logins.get("dormant_over_30d_details", [])
+            if isinstance(dormant_details, list) and len(dormant_details) > displayed_names_in_evidence:
+                rows = [
+                    [
+                        "30d+",
+                        str(item.get("user", "unknown")) if isinstance(item, dict) else str(item),
+                        str(item.get("role", "unknown")) if isinstance(item, dict) else "unknown",
+                    ]
+                    for item in dormant_details
+                ]
+                return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_details), "Recommendation Dormant Users"
+
+            dormant_users = user_logins.get("dormant_over_30d", [])
+            if isinstance(dormant_users, list) and len(dormant_users) > displayed_names_in_evidence:
+                rows = [["30d+", user, "unknown"] for user in dormant_users]
+                return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_users), "Recommendation Dormant Users"
+            return None
+
+    return None
+
+
 def _paginate_table_to_slides(
     prs: Presentation,
     all_rows: list[list[Any]],
@@ -1712,6 +1767,23 @@ def write_executive_pptx(run_dir: Path) -> Path:
     recs_footnote = _add_sampling_footnote(slide, total_recs, shown_recs, y_position=6.35)
     if total_recs > shown_recs and recs_footnote is not None:
         pending_appendix_links.append((recs_footnote, "Detailed Recommendations (Page 1/"))
+
+    dormant_appendix = _dormant_recommendation_appendix_data(recommendations, user_logins)
+    if dormant_appendix is not None:
+        dormant_rows, dormant_headers, shown_dormant_users, total_dormant_users, dormant_title = dormant_appendix
+        dormant_footer = _add_textbox(
+            slide,
+            0.62,
+            7.0,
+            8.5,
+            0.18,
+            f"Showing {shown_dormant_users} of {total_dormant_users} dormant users from Evidence. Click to open appendix full list.",
+            font_size=8,
+            color=_hex_color("2563EB"),
+            underline=True,
+        )
+        pending_appendix_links.append((dormant_footer, f"{dormant_title} (Page 1/"))
+        _queue_appendix_table(dormant_rows, dormant_headers, dormant_title)
 
     errors = summary.get("errors", [])
     warnings = summary.get("warnings", [])
@@ -2343,8 +2415,8 @@ def write_technical_pptx(run_dir: Path) -> Path:
     _add_background(slide, "FFFFFF")
     _add_section_header(slide, "API Hygiene", "Connector activity, source IP ownership, and origin country for API access sessions.")
 
-    connector_rows = _rows_from_list(api_connector_use.get("active_connectors", []), ["connector_id", "session_count"], 8)
-    connector_counts = {str(row[0]): _to_numeric(row[1]) for row in connector_rows if len(row) == 2}
+    connector_rows = _rows_from_list(api_connector_use.get("active_connectors", []), ["connector_id", "api_access_level_type", "session_count"], 8)
+    connector_counts = {str(row[0]): _to_numeric(row[2]) for row in connector_rows if len(row) == 3}
     connector_items = _sorted_mapping_items(connector_counts, limit=5, sort_by_value=True)
 
     top_source_ips = api_connector_use.get("top_source_ips", []) if isinstance(api_connector_use, dict) else []
@@ -2399,13 +2471,23 @@ def write_technical_pptx(run_dir: Path) -> Path:
 
     _add_textbox(
         slide,
-        0.65,
-        5.1,
-        12.0,
-        0.22,
+        8.05,
+        5.85,
+        4.6,
+        1.1,
         "Owner reflects the enriched organization field from IP lookup; country reflects the source IP's geolocation lookup.",
         font_size=10,
         color=_hex_color("55606E"),
+    )
+
+    _add_table(
+        slide,
+        0.65,
+        5.25,
+        7.2,
+        1.65,
+        ["Connector", "API Access Level Type", "Sessions"],
+        connector_rows or [["n/a", "n/a", 0]],
     )
 
     watchlist_rows = _watchlist_detail_rows(watchlists.get("watchlist_details", [])) if isinstance(watchlists, dict) else []
@@ -2555,6 +2637,23 @@ def write_technical_pptx(run_dir: Path) -> Path:
     _add_table(slide, 0.55, 1.25, 12.2, 5.8, ["Priority", "Area", "Recommendation", "Evidence"], rec_rows or [["n/a", "n/a", "No recommendations were generated.", ""]])
     
     recs_footnote = _add_sampling_footnote(slide, total_recs_tech, shown_recs_tech, y_position=7.18)
+
+    dormant_appendix = _dormant_recommendation_appendix_data(recommendations, user_logins)
+    if dormant_appendix is not None:
+        dormant_rows, dormant_headers, shown_dormant_users, total_dormant_users, dormant_title = dormant_appendix
+        dormant_footer = _add_textbox(
+            slide,
+            0.62,
+            6.98,
+            8.5,
+            0.18,
+            f"Showing {shown_dormant_users} of {total_dormant_users} dormant users from Evidence. Click to open appendix full list.",
+            font_size=8,
+            color=_hex_color("2563EB"),
+            underline=True,
+        )
+        pending_appendix_links.append((dormant_footer, f"{dormant_title} (Page 1/"))
+        _queue_appendix_table(dormant_rows, dormant_headers, dormant_title)
 
     # Add pagination slides for full recommendation list if needed
     if total_recs_tech > shown_recs_tech:
