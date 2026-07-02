@@ -81,6 +81,7 @@ class CBCClient:
 
         for backend in backends:
             try:
+                backend = backend.rstrip("/") if backend else backend
                 orgs_url = f"{backend}/appservices/v5/orgs/"
                 orgs_data = self._get(orgs_url).json()
                 org = orgs_data["organizations"][0]["id"]
@@ -96,7 +97,7 @@ class CBCClient:
         raise RuntimeError("Unable to discover tenant/backend")
 
     def get_org_details(self, backend_url: str, tenant_id: str) -> dict[str, Any]:
-        url = f"{backend_url}/appservices/v5/orgs/{tenant_id}/"
+        url = f"{backend_url.rstrip('/')}/appservices/v5/orgs/{tenant_id}/"
         return self._get(url).json()
 
     def get_devices(self, backend_url: str, tenant_key: str, rows: int = 5000) -> list[dict[str, Any]]:
@@ -517,6 +518,24 @@ class CBCClient:
         if last_error:
             raise RuntimeError(f"Unable to fetch users: {last_error}") from last_error
         return []
+
+    def get_org_entitlements(self, backend_url: str, tenant_key: str) -> dict[str, Any]:
+        """Fetch org entitlements from /entitlements/v1/orgs/{tenant_key}/details.
+
+        Returns the raw response dict, which contains a ``features`` list where each
+        item has a ``feature_id`` in the form ``psc:feature:<name>``.  Only features
+        present in the list are enabled for the org.
+
+        Raises RuntimeError on HTTP or network failure.
+        """
+        url = f"{backend_url.rstrip('/')}/entitlements/v1/orgs/{tenant_key}/details"
+        try:
+            data = self._get(url).json()
+        except Exception as exc:
+            raise RuntimeError(f"Unable to fetch org entitlements: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected entitlements response type: {type(data)}")
+        return data
 
     def probe_product_endpoints(self, backend_url: str, tenant_key: str) -> dict[str, Any]:
         """Probe product endpoints and classify as enabled/not_enabled/unknown.

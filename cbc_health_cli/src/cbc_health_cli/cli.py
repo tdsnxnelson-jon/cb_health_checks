@@ -138,19 +138,56 @@ def _has_workloads_policy_signal(policies: list[dict[str, Any]]) -> bool:
     return False
 
 
+# Maps the suffix of a ``psc:feature:<name>`` entitlement feature ID to the
+# internal product name used throughout the codebase.  Only the products we
+# actively report on are included; unrecognised feature IDs are ignored.
+_ENTITLEMENT_FEATURE_MAP: dict[str, str] = {
+    "defense": "NGAV",
+    "threathunter": "EEDR",
+    "hbfw": "HBFW",
+    "livequery": "Live Query",
+    "xdr": "XDR",
+    "vulnerability": "Vulnerability Management",
+    "vulnerabilityendpoint": "Vulnerability Management for Endpoints",
+    "workloadinv": "Workloads",
+}
+
+
+def _products_from_entitlements(entitlements: dict[str, Any]) -> list[str] | None:
+    """Extract enabled product names from an entitlements response dict.
+
+    Returns an ordered list of product names, or None if the response does not
+    contain a recognisable ``features`` list (so callers can fall back to
+    heuristics).
+    """
+    features = entitlements.get("features")
+    if not isinstance(features, list):
+        return None
+    products: list[str] = []
+    for item in features:
+        if not isinstance(item, dict):
+            continue
+        feature_id = str(item.get("feature_id", ""))
+        # feature_id format: "psc:feature:<name>"
+        suffix = feature_id.split(":")[-1].lower()
+        product = _ENTITLEMENT_FEATURE_MAP.get(suffix)
+        if product and product not in products:
+            products.append(product)
+    return products
+
+
 def _detect_products(
     *,
     configured_products: list[str] | None,
     org_info: dict[str, Any],
     policies: list[dict[str, Any]],
     data_collection_configs: list[dict[str, Any]],
-    probe_results: dict[str, Any] | None,
+    entitlements: dict[str, Any] | None,
 ) -> dict[str, Any]:
     detected_products: list[str] = []
     not_enabled_products: list[str] = []
     evidence: dict[str, list[str]] = {}
     negative_evidence: dict[str, list[str]] = {}
-    timestamp_map = _extract_timestamp_map(org_info)
 
     def add(product: str, reason: str) -> None:
         if product not in detected_products:
@@ -162,38 +199,30 @@ def _detect_products(
             not_enabled_products.append(product)
         negative_evidence.setdefault(product, []).append(reason)
 
-    def remove(product: str) -> None:
-        if product in detected_products:
-            detected_products.remove(product)
+    entitlement_products = _products_from_entitlements(entitlements or {})
 
-    ngav_disabled_signal = "ORG_DISABLE_DEFENSE_RULES" in timestamp_map
-
-    if ngav_disabled_signal:
-        add_negative("NGAV", "org.changeTimestamps.timestampMap contains ORG_DISABLE_DEFENSE_RULES (NGAV disabled signal)")
-    elif str(org_info.get("storageProfile", "")).strip().upper() == "NGAV":
-        add("NGAV", "org.storageProfile is NGAV")
-    if "ORG_THREATHUNTER_RULES" in timestamp_map:
-        add("EEDR", "org.changeTimestamps.timestampMap contains ORG_THREATHUNTER_RULES")
-    if _any_xdr_rule_config(data_collection_configs):
-        add("XDR", "policy data_collection configs include an XDR rule")
-    if _has_workloads_policy_signal(policies):
-        add("Workloads", "policy payload contains workload auto-deregister settings")
-
-    probe_product_map = (probe_results or {}).get("products", {}) if isinstance(probe_results, dict) else {}
-    if isinstance(probe_product_map, dict):
-        for product in ("NGAV", "EEDR", "Live Query", "Vulnerability Management", "HBFW", "Workloads"):
-            product_probe = probe_product_map.get(product, {})
-            if not isinstance(product_probe, dict):
-                continue
-            if product_probe.get("detected"):
-                if product_probe.get("classification") == "enabled_via_400":
-                    add(product, "product endpoint probe returned HTTP 400 without any HTTP 403 (treated as enabled)")
-                else:
-                    add(product, "product endpoint probe returned HTTP 200")
-                continue
-            if product_probe.get("classification") == "not_enabled":
-                remove(product)
-                add_negative(product, "all successful product probes returned HTTP 403")
+    if entitlement_products is not None:
+        # Primary path: entitlements API returned a usable feature list.
+        all_reportable = list(_ENTITLEMENT_FEATURE_MAP.values())
+        for product in entitlement_products:
+            add(product, "entitlements API: feature enabled")
+        for product in all_reportable:
+            if product not in entitlement_products:
+                add_negative(product, "entitlements API: feature not present")
+    else:
+        # Fallback path: entitlements call failed; use org-info heuristics.
+        timestamp_map = _extract_timestamp_map(org_info)
+        ngav_disabled_signal = "ORG_DISABLE_DEFENSE_RULES" in timestamp_map
+        if ngav_disabled_signal:
+            add_negative("NGAV", "org.changeTimestamps.timestampMap contains ORG_DISABLE_DEFENSE_RULES")
+        elif str(org_info.get("storageProfile", "")).strip().upper() == "NGAV":
+            add("NGAV", "org.storageProfile is NGAV")
+        if "ORG_THREATHUNTER_RULES" in timestamp_map:
+            add("EEDR", "org.changeTimestamps.timestampMap contains ORG_THREATHUNTER_RULES")
+        if _any_xdr_rule_config(data_collection_configs):
+            add("XDR", "policy data_collection configs include an XDR rule")
+        if _has_workloads_policy_signal(policies):
+            add("Workloads", "policy payload contains workload auto-deregister settings")
 
     final_products = configured_products[:] if configured_products else detected_products[:]
     source = "config" if configured_products else "auto"
@@ -206,7 +235,7 @@ def _detect_products(
         "final": final_products,
         "evidence": evidence,
         "negative_evidence": negative_evidence,
-        "probe_results": probe_results or {},
+        "entitlements": entitlements or {},
     }
 
 
@@ -296,7 +325,7 @@ def run_command(args: argparse.Namespace) -> int:
     reputation_overrides: list[dict[str, Any]] = []
     data_collection_configs: list[dict[str, Any]] = []
     org_info: dict[str, Any] = {}
-    product_probe_results: dict[str, Any] = {}
+    org_entitlements: dict[str, Any] = {}
 
     try:
         org_details = client.get_org_details(backend_url, tenant_id)
@@ -308,13 +337,13 @@ def run_command(args: argparse.Namespace) -> int:
     except Exception as exc:
         summary["checks"]["org"] = {"status": "error"}
         summary["errors"].append(f"org check failed: {exc}")
-    status.advance("Starting product endpoint probes")
+    status.advance("Starting entitlements fetch")
 
     try:
-        product_probe_results = client.probe_product_endpoints(backend_url, tenant_key)
+        org_entitlements = client.get_org_entitlements(backend_url, tenant_key)
     except Exception as exc:
-        summary["warnings"].append(f"product endpoint probing failed: {exc}")
-        product_probe_results = {}
+        summary["warnings"].append(f"entitlements API unavailable, falling back to heuristics: {exc}")
+        org_entitlements = {}
     status.advance("Starting device check")
 
     try:
@@ -339,24 +368,18 @@ def run_command(args: argparse.Namespace) -> int:
 
     try:
         policies = client.get_policies(backend_url, tenant_key)
-        # Resolve NGAV capability from explicit override, configured products, or org signals.
+        # Resolve NGAV capability from explicit override, configured products, or entitlements.
         if config.ngav_enabled is not None:
             ngav_enabled = config.ngav_enabled
         else:
-            timestamp_map = _extract_timestamp_map(org_info)
-            probe_product_map = (
-                product_probe_results.get("products", {})
-                if isinstance(product_probe_results, dict)
-                else {}
-            )
-            ngav_probe = probe_product_map.get("NGAV", {}) if isinstance(probe_product_map, dict) else {}
+            entitlement_products = _products_from_entitlements(org_entitlements)
             if config.products:
                 ngav_enabled = "NGAV" in config.products
-            elif isinstance(ngav_probe, dict) and str(ngav_probe.get("classification", "")) == "not_enabled":
-                ngav_enabled = False
-            elif isinstance(ngav_probe, dict) and bool(ngav_probe.get("detected")):
-                ngav_enabled = True
+            elif entitlement_products is not None:
+                ngav_enabled = "NGAV" in entitlement_products
             else:
+                # Fallback to org-info heuristics when entitlements are unavailable.
+                timestamp_map = _extract_timestamp_map(org_info)
                 if "ORG_DISABLE_DEFENSE_RULES" in timestamp_map:
                     ngav_enabled = False
                 else:
@@ -421,7 +444,11 @@ def run_command(args: argparse.Namespace) -> int:
     status.advance("Starting watchlist check")
 
     timestamp_map: dict[str, Any] = _extract_timestamp_map(org_info)
-    watchlist_checks_enabled = "ORG_THREATHUNTER_RULES" in timestamp_map
+    entitlement_products = _products_from_entitlements(org_entitlements)
+    if entitlement_products is not None:
+        watchlist_checks_enabled = "EEDR" in entitlement_products
+    else:
+        watchlist_checks_enabled = "ORG_THREATHUNTER_RULES" in timestamp_map
 
     if not watchlist_checks_enabled:
         summary["checks"]["watchlists"] = {
@@ -460,7 +487,7 @@ def run_command(args: argparse.Namespace) -> int:
         org_info=org_info,
         policies=policies,
         data_collection_configs=data_collection_configs,
-        probe_results=product_probe_results,
+        entitlements=org_entitlements,
     )
     summary["products"] = product_detection
 

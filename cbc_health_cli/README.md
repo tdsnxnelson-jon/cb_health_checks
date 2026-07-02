@@ -47,6 +47,23 @@ pip install -r requirements.txt
 
 Copy and edit [config.example.yaml](config.example.yaml), or create a JSON config file if YAML parsing is blocked by policy.
 
+## API Key Setup
+
+The API key used with this tool requires access to multiple Carbon Black Cloud endpoints. 
+
+**Recommended approach:** Use the built-in **"View All"** role when assigning the API key. This ensures access to all required endpoints, including legacy platform endpoints not fully documented in the RBAC system.
+
+**Alternative approach (custom access level):** If you require a more restrictive custom access level, ensure the following permissions are enabled with **READ** operations:
+- `device` – for device inventory
+- `org.alerts` – for alert data
+- `org.policies` – for policy and rule details
+- `org.audits` – for audit logs
+- `org.watchlists` – for threat watchlists
+- `org.reputations` – for reputation overrides
+- `org.info` – for organization metadata (required for org details endpoint)
+
+Note: The legacy `/appservices/v5/orgs/{id}/` endpoint used for organization metadata requires `org.info` permission in the custom access level, or the "View All" built-in role.
+
 ## Run
 
 ```powershell
@@ -114,8 +131,8 @@ By default, outputs are written under:
 - `./output/<tenant_key>/<timestamp>/grants.csv` (if grants API call succeeds)
 - `./output/<tenant_key>/<timestamp>/reputation_overrides.csv` (if reputation overrides API call succeeds)
 - `./output/<tenant_key>/<timestamp>/executive_summary.md` (human-readable one-page summary)
-- `./output/<tenant_key>/<timestamp>/executive_summary.pptx` (PowerPoint deck generated from `summary.json`)
-- `./output/<tenant_key>/<timestamp>/technical_deck.pptx` (technical PowerPoint deck generated from `summary.json`)
+- `./output/<tenant_key>/<timestamp>/executive_summary_<orgDomain>.pptx` (PowerPoint deck generated from `summary.json`; orgDomain is sanitized for filename safety)
+- `./output/<tenant_key>/<timestamp>/technical_deck_<orgDomain>.pptx` (technical PowerPoint deck generated from `summary.json`; orgDomain is sanitized for filename safety)
 
 Drift baseline lookup is tenant-key scoped, so each run is compared against the most recent run for the same tenant key.
 

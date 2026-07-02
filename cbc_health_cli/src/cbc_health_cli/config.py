@@ -46,7 +46,16 @@ def load_app_config(config_path: Path | None, overrides: dict[str, Any]) -> AppC
         raise ValueError(f"Missing required fields: {', '.join(missing)}")
 
     # Validate and normalize products when explicitly provided.
-    VALID_PRODUCTS = {"NGAV", "EEDR", "Live Query", "XDR", "Vulnerability Management", "HBFW", "Workloads"}
+    VALID_PRODUCTS = {
+        "NGAV",
+        "EEDR",
+        "Live Query",
+        "XDR",
+        "Vulnerability Management",
+        "Vulnerability Management for Endpoints",
+        "HBFW",
+        "Workloads",
+    }
     products: list[str] | None = None
     products_raw = merged.get("products")
     if products_raw is not None:
@@ -89,11 +98,14 @@ def load_app_config(config_path: Path | None, overrides: dict[str, Any]) -> AppC
     if alert_volume_peak_daily_threshold <= 0:
         raise ValueError("alert_volume_peak_daily_threshold must be > 0")
 
+    raw_backend_url = merged.get("backend_url")
+    normalized_backend_url = str(raw_backend_url).rstrip("/") if raw_backend_url is not None else None
+
     return AppConfig(
         customer_name=str(merged["customer_name"]),
         api_id=str(merged["api_id"]),
-        api_key=str(merged["api_key"]),
-        backend_url=merged.get("backend_url"),
+        api_key=str(merged["api_key"]).strip(),
+        backend_url=normalized_backend_url,
         tenant_id=merged.get("tenant_id"),
         tenant_key=merged.get("tenant_key"),
         output_dir=output_dir,

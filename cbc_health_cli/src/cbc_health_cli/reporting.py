@@ -1345,7 +1345,8 @@ def write_executive_pptx(run_dir: Path) -> Path:
         raise FileNotFoundError(f"summary.json not found in {run_dir}")
 
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    pptx_path = run_dir / "executive_summary.pptx"
+    org_domain = _safe_path_part(_get_org_domain(summary))
+    pptx_path = run_dir / f"executive_summary_{org_domain}.pptx"
 
     prs = Presentation()
     prs.slide_width = Inches(13.333)
@@ -1777,7 +1778,8 @@ def write_technical_pptx(run_dir: Path) -> Path:
         raise FileNotFoundError(f"summary.json not found in {run_dir}")
 
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    pptx_path = run_dir / "technical_deck.pptx"
+    org_domain = _safe_path_part(_get_org_domain(summary))
+    pptx_path = run_dir / f"technical_deck_{org_domain}.pptx"
 
     prs = Presentation()
     prs.slide_width = Inches(13.333)
@@ -2199,29 +2201,6 @@ def write_technical_pptx(run_dir: Path) -> Path:
         )
 
     setting_items = _policy_settings_concern_items(policy_settings)
-    _add_column_chart(
-        slide,
-        7.85,
-        2.85,
-        4.85,
-        2.15,
-        "Policy Settings of Concern",
-        [name for name, _ in setting_items],
-        [value for _, value in setting_items],
-        series_name="Policies",
-        show_data_labels=False,
-    )
-
-    _add_textbox(
-        slide,
-        7.9,
-        5.1,
-        4.7,
-        0.18,
-        "Detailed rationale moved to next slide for readability.",
-        font_size=9,
-        color=_hex_color("55606E"),
-    )
 
     drift_details = drift.get("changed_policy_details", []) if isinstance(drift, dict) else []
     drift_rows = _rows_from_list(drift_details, ["policy_name", "change_count"], 6)
