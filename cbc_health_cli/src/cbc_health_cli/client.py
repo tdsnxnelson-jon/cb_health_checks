@@ -70,6 +70,10 @@ class CBCClient:
                 "users",
                 "overrides",
                 "reputations",
+                "runs",
+                "templates",
+                "sessions",
+                "scheduled_queries",
             ):
                 value = data.get(key)
                 if isinstance(value, list):
@@ -445,6 +449,194 @@ class CBCClient:
                 attempts_context = f" (attempts: {' | '.join(attempt_failures[:8])})"
             raise RuntimeError(f"Unable to fetch audit logs: {last_error}{attempt_context}{attempts_context}") from last_error
         return []
+
+    def get_live_query_activity(
+        self,
+        backend_url: str,
+        tenant_key: str,
+        rows: int = 2000,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Fetch Live Query collections from Audit and Remediation APIs.
+
+        Returns a dict with list payloads for keys: runs, templates,
+        scheduled_queries, sessions.
+        """
+        normalized_backend = backend_url.rstrip("/")
+        target_rows = max(1, rows)
+
+        def _http_diag(response: requests.Response) -> str:
+            status = response.status_code
+            ctype = response.headers.get("Content-Type", "unknown")
+            text = (response.text or "").strip()
+            snippet = text[:200].replace("\r", " ").replace("\n", " ") if text else "<empty>"
+            return f"status={status}, content_type={ctype}, body_prefix={snippet}"
+
+        def _parse_json(response: requests.Response) -> Any:
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise RuntimeError(f"Non-JSON response: {_http_diag(response)}") from exc
+
+        def _paginate_get(url: str, page_size: int = 500) -> list[dict[str, Any]]:
+            all_results: list[dict[str, Any]] = []
+            start = 0
+            max_iterations = 25
+            iteration = 0
+
+            while iteration < max_iterations and len(all_results) < target_rows:
+                request_rows = min(page_size, target_rows - len(all_results))
+                params = {"start": start, "rows": request_rows}
+                response = self._request("GET", url, params=params)
+                response.raise_for_status()
+                data = _parse_json(response)
+                results = self._extract_list_payload(data)
+                if not results:
+                    break
+                all_results.extend(results)
+                if len(results) < request_rows:
+                    break
+                start += len(results)
+                iteration += 1
+
+            return all_results[:target_rows]
+
+        def _paginate_search_post(url: str, page_size: int = 500) -> list[dict[str, Any]]:
+            all_results: list[dict[str, Any]] = []
+            start = 0
+            max_iterations = 25
+            iteration = 0
+
+            while iteration < max_iterations and len(all_results) < target_rows:
+                request_rows = min(page_size, target_rows - len(all_results))
+                payload = {
+                    "query": "",
+                    "start": start,
+                    "rows": request_rows,
+                }
+                response = self._request("POST", url, json=payload)
+                response.raise_for_status()
+                data = _parse_json(response)
+                results = self._extract_list_payload(data)
+                if not results:
+                    break
+                all_results.extend(results)
+                if len(results) < request_rows:
+                    break
+                start += len(results)
+                iteration += 1
+
+            return all_results[:target_rows]
+
+        collection_paths: dict[str, list[dict[str, Any]]] = {
+            "runs": [
+                {
+                    "method": "POST",
+                    "url": f"{normalized_backend}/livequery/v1/orgs/{tenant_key}/runs/_search",
+                },
+                {
+                    "method": "POST",
+                    "url": f"{normalized_backend}/appservices/livequery/v1/orgs/{tenant_key}/runs/_search",
+                },
+                {
+                    "method": "GET",
+                    "url": f"{normalized_backend}/appservices/v6/orgs/{tenant_key}/livequery/runs",
+                },
+                {
+                    "method": "GET",
+                    "url": f"{normalized_backend}/appservices/livequery/v1/orgs/{tenant_key}/runs",
+                },
+            ],
+            "templates": [
+                {
+                    "method": "POST",
+                    "url": f"{normalized_backend}/livequery/v1/orgs/{tenant_key}/templates/_search",
+                },
+                {
+                    "method": "POST",
+                    "url": f"{normalized_backend}/appservices/livequery/v1/orgs/{tenant_key}/templates/_search",
+                },
+                {
+                    "method": "GET",
+                    "url": f"{normalized_backend}/appservices/v6/orgs/{tenant_key}/livequery/templates",
+                },
+                {
+                    "method": "GET",
+                    "url": f"{normalized_backend}/appservices/livequery/v1/orgs/{tenant_key}/templates",
+                },
+            ],
+            "scheduled_queries": [
+                {
+                    "method": "POST",
+                    "url": f"{normalized_backend}/livequery/v1/orgs/{tenant_key}/scheduled_queries/_search",
+                },
+                {
+                    "method": "POST",
+                    "url": f"{normalized_backend}/appservices/livequery/v1/orgs/{tenant_key}/scheduled_queries/_search",
+                },
+                {
+                    "method": "GET",
+                    "url": f"{normalized_backend}/appservices/v6/orgs/{tenant_key}/livequery/scheduled_queries",
+                },
+                {
+                    "method": "GET",
+                    "url": f"{normalized_backend}/appservices/livequery/v1/orgs/{tenant_key}/scheduled_queries",
+                },
+            ],
+            "sessions": [
+                {
+                    "method": "POST",
+                    "url": f"{normalized_backend}/livequery/v1/orgs/{tenant_key}/sessions/_search",
+                },
+                {
+                    "method": "POST",
+                    "url": f"{normalized_backend}/appservices/livequery/v1/orgs/{tenant_key}/sessions/_search",
+                },
+                {
+                    "method": "GET",
+                    "url": f"{normalized_backend}/appservices/v6/orgs/{tenant_key}/livequery/sessions",
+                },
+                {
+                    "method": "GET",
+                    "url": f"{normalized_backend}/appservices/livequery/v1/orgs/{tenant_key}/sessions",
+                },
+            ],
+        }
+
+        last_error: Exception | None = None
+        attempt_failures: list[str] = []
+        collections: dict[str, list[dict[str, Any]]] = {
+            "runs": [],
+            "templates": [],
+            "scheduled_queries": [],
+            "sessions": [],
+        }
+
+        for key, candidates in collection_paths.items():
+            for candidate in candidates:
+                method = str(candidate.get("method", "GET")).upper()
+                url = str(candidate.get("url", ""))
+                try:
+                    if method == "POST":
+                        rows_out = _paginate_search_post(url)
+                    else:
+                        rows_out = _paginate_get(url)
+                    if rows_out:
+                        collections[key] = rows_out
+                        break
+                except Exception as exc:
+                    last_error = exc
+                    attempt_failures.append(f"{method} {url} -> {exc}")
+
+        if any(collections.values()):
+            return collections
+
+        if last_error:
+            attempts_context = ""
+            if attempt_failures:
+                attempts_context = f" (attempts: {' | '.join(attempt_failures[:8])})"
+            raise RuntimeError(f"Unable to fetch live query activity: {last_error}{attempts_context}") from last_error
+
+        return collections
 
 
 

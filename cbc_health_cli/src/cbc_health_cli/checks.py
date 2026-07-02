@@ -1048,6 +1048,402 @@ def summarize_api_connector_use(
     }
 
 
+def summarize_live_query_audit_remediation(
+    live_query_activity: dict[str, Any] | None,
+    audit_logs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize Live Query activity from API data with audit-log fallback."""
+
+    known_recommended = {
+        "active sensor policies",
+        "installed windows patches",
+        "failed rdp logon - security event log",
+    }
+
+    def _normalize_query_name(name: str) -> str:
+        normalized = (name or "").strip().lower()
+        normalized = re.sub(r"\s*\(updated\)\s*$", "", normalized)
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized
+
+    def _empty_payload(source: str) -> dict[str, Any]:
+        return {
+            "data_source": source,
+            "total_live_query_events": 0,
+            "total_query_runs": 0,
+            "total_query_creates": 0,
+            "recommended_query_runs": 0,
+            "custom_query_runs": 0,
+            "avg_endpoints_per_query": None,
+            "queried_os_breakdown": {},
+            "users_query_creates": [],
+            "top_queries": [],
+            "daily_event_counts": {},
+            "known_recommended_names": sorted(known_recommended),
+        }
+
+    def _first_text(record: dict[str, Any], keys: list[str], default: str = "") -> str:
+        for key in keys:
+            value = record.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return default
+
+    def _first_int(record: dict[str, Any], keys: list[str]) -> int | None:
+        for key in keys:
+            value = record.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return int(float(value))
+            except Exception:
+                continue
+        return None
+
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(float(value))
+        except Exception:
+            return 0
+
+    def _is_true(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        text = str(value or "").strip().lower()
+        return text in {"true", "1", "yes", "enabled"}
+
+    def _device_filter_oses(record: dict[str, Any]) -> list[str]:
+        all_oses = ["Windows", "macOS", "Linux"]
+        device_filter = record.get("device_filter")
+        if not isinstance(device_filter, dict):
+            return all_oses
+
+        os_value = device_filter.get("os")
+        if os_value in (None, "", "null", "None"):
+            return all_oses
+
+        raw_values: list[str] = []
+        if isinstance(os_value, list):
+            raw_values = [str(v).strip() for v in os_value if str(v).strip()]
+        else:
+            raw_values = [str(os_value).strip()] if str(os_value).strip() else []
+
+        if not raw_values:
+            return all_oses
+
+        mapped: list[str] = []
+        for raw in raw_values:
+            normalized = raw.lower()
+            if "win" in normalized:
+                mapped.append("Windows")
+            elif "mac" in normalized or "osx" in normalized:
+                mapped.append("macOS")
+            elif "lin" in normalized:
+                mapped.append("Linux")
+            else:
+                mapped.append(raw)
+
+        # Preserve order, remove duplicates.
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for os_name in mapped:
+            if os_name not in seen:
+                seen.add(os_name)
+                deduped.append(os_name)
+        return deduped
+
+    def _is_recommended_from_run(run: dict[str, Any]) -> bool:
+        rqid = _first_text(run, ["recommended_query_id", "recommendedQueryId"], "")
+        return rqid not in ("", "null", "None")
+
+    def _summarize_from_api(lq: dict[str, Any]) -> dict[str, Any]:
+        runs_raw = lq.get("runs", []) if isinstance(lq, dict) else []
+        templates = lq.get("templates", []) if isinstance(lq, dict) else []
+        runs = [run for run in runs_raw if isinstance(run, dict)]
+
+        if not runs:
+            return _empty_payload("api")
+
+        template_by_id: dict[str, dict[str, Any]] = {}
+        template_name_by_id: dict[str, str] = {}
+        template_os_by_id: dict[str, list[str]] = {}
+        users_query_runs: Counter[str] = Counter()
+
+        for template in templates:
+            if not isinstance(template, dict):
+                continue
+            tid = _first_text(template, ["id", "template_id", "templateId", "query_id", "queryId"]) or ""
+            tname = _first_text(template, ["name", "query_name", "queryName", "title"], "Unknown")
+
+            if tid:
+                template_by_id[tid] = template
+                template_name_by_id[tid] = tname
+                template_os_by_id[tid] = _device_filter_oses(template)
+
+        query_run_counts: Counter[str] = Counter()
+        query_os: dict[str, set[str]] = defaultdict(set)
+        os_counter: Counter[str] = Counter()
+        endpoints_seen: list[int] = []
+        daily_event_counts: Counter[str] = Counter()
+        query_type_by_name: dict[str, str] = {}
+
+        total_query_runs = 0
+        total_query_creates = 0
+
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            total_query_runs += 1
+
+            run_template_id = _first_text(run, ["template_id", "templateId", "query_id", "queryId", "scheduled_query_id", "scheduledQueryId"], "")
+            query_name = _first_text(run, ["name", "query_name", "queryName", "template_name", "templateName", "scheduled_query_name", "scheduledQueryName", "title"], "")
+            if not query_name and run_template_id:
+                query_name = template_name_by_id.get(run_template_id, "Unknown")
+            if not query_name:
+                query_name = "Unknown"
+
+            query_type = "Recommended" if _is_recommended_from_run(run) else "Custom"
+
+            query_type_by_name[query_name] = query_type
+            query_run_counts[query_name] += 1
+
+            creator = _first_text(run, ["created_by", "creator", "actor", "username", "user", "principal"], "")
+            if creator:
+                users_query_runs[creator] += 1
+
+            endpoint_count = _first_int(
+                run,
+                [
+                    "device_count",
+                    "target_count",
+                    "endpoint_count",
+                    "num_devices",
+                    "total_devices",
+                    "results_count",
+                    "success_count",
+                ],
+            )
+            if endpoint_count is not None:
+                endpoints_seen.append(endpoint_count)
+
+            run_oses = _device_filter_oses(run)
+            if (not run_oses or run_oses == ["Windows", "macOS", "Linux"]) and run_template_id:
+                run_oses = template_os_by_id.get(run_template_id, run_oses)
+            for os_name in run_oses:
+                query_os[query_name].add(os_name)
+                os_counter[os_name] += 1
+
+            run_time = _to_dt(_first_text(run, ["create_time", "created_at", "timestamp", "run_time", "start_time"], ""))
+            if run_time:
+                daily_event_counts[run_time.date().isoformat()] += 1
+
+        recommended_query_runs = 0
+        custom_query_runs = 0
+        top_queries: list[dict[str, Any]] = []
+        for query_name, run_count in query_run_counts.most_common(15):
+            query_type = query_type_by_name.get(query_name, "Custom")
+            if query_type == "Recommended":
+                recommended_query_runs += run_count
+            else:
+                custom_query_runs += run_count
+
+            top_queries.append(
+                {
+                    "query_name": query_name,
+                    "run_count": run_count,
+                    "query_type": query_type,
+                    "os": ", ".join(sorted(query_os.get(query_name, set()))) or "Unknown",
+                }
+            )
+
+        avg_endpoints_per_query: float | None
+        if endpoints_seen:
+            avg_endpoints_per_query = round(sum(endpoints_seen) / len(endpoints_seen), 2)
+        else:
+            avg_endpoints_per_query = None
+
+        users_rows = [
+            {"user": user, "run_count": count, "create_count": count}
+            for user, count in users_query_runs.most_common(15)
+        ]
+
+        return {
+            "data_source": "api",
+            "total_live_query_events": int(total_query_runs),
+            "total_query_runs": total_query_runs,
+            "total_query_creates": total_query_creates,
+            "total_unique_queries_run": int(len(query_run_counts)),
+            "recommended_query_runs": recommended_query_runs,
+            "custom_query_runs": custom_query_runs,
+            "avg_endpoints_per_query": avg_endpoints_per_query,
+            "queried_os_breakdown": dict(os_counter),
+            "users_query_creates": users_rows,
+            "top_queries": top_queries,
+            "daily_event_counts": dict(sorted(daily_event_counts.items(), key=lambda kv: kv[0])),
+            "known_recommended_names": sorted(known_recommended),
+        }
+
+    def _summarize_from_audit(logs: list[dict[str, Any]]) -> dict[str, Any]:
+        live_events = [event for event in logs if isinstance(event, dict) and _event_is_live_query(event)]
+        if not live_events:
+            return _empty_payload("audit")
+
+        users_query_creates: Counter[str] = Counter()
+        query_run_counts: Counter[str] = Counter()
+        query_os: dict[str, set[str]] = defaultdict(set)
+        daily_event_counts: Counter[str] = Counter()
+        os_counter: Counter[str] = Counter()
+        endpoints_seen: list[int] = []
+
+        total_query_runs = 0
+        total_query_creates = 0
+
+        for event in live_events:
+            desc = str(_pick_value(event, ["description", "message", "details"], ""))
+            action = _parse_action(desc)
+            query_name = _parse_query_name(desc)
+            actor = str(_pick_value(event, ["actor", "username", "user", "principal"], "unknown")).strip() or "unknown"
+
+            event_time = _to_dt(_pick_value(event, ["timestamp", "create_time", "event_time", "time"]))
+            if event_time:
+                daily_event_counts[event_time.date().isoformat()] += 1
+
+            if action == "created":
+                total_query_creates += 1
+                users_query_creates[actor] += 1
+
+            if action == "run":
+                total_query_runs += 1
+                query_run_counts[query_name] += 1
+
+                for os_name in _parse_os(desc, query_name):
+                    query_os[query_name].add(os_name)
+                    os_counter[os_name] += 1
+
+                endpoint_count = _parse_endpoints_count(desc)
+                if endpoint_count is not None:
+                    endpoints_seen.append(endpoint_count)
+
+        recommended_query_runs = 0
+        custom_query_runs = 0
+        top_queries: list[dict[str, Any]] = []
+        for query_name, run_count in query_run_counts.most_common(15):
+            normalized = _normalize_query_name(query_name)
+            is_recommended = normalized in known_recommended
+            if is_recommended:
+                recommended_query_runs += run_count
+                query_type = "Recommended"
+            else:
+                custom_query_runs += run_count
+                query_type = "Custom"
+            top_queries.append(
+                {
+                    "query_name": query_name,
+                    "run_count": run_count,
+                    "query_type": query_type,
+                    "os": ", ".join(sorted(query_os.get(query_name, set()))) or "Unknown",
+                }
+            )
+
+        avg_endpoints_per_query: float | None
+        if endpoints_seen:
+            avg_endpoints_per_query = round(sum(endpoints_seen) / len(endpoints_seen), 2)
+        else:
+            avg_endpoints_per_query = None
+
+        users_rows = [
+            {"user": user, "create_count": count}
+            for user, count in users_query_creates.most_common(15)
+        ]
+
+        return {
+            "data_source": "audit",
+            "total_live_query_events": len(live_events),
+            "total_query_runs": total_query_runs,
+            "total_query_creates": total_query_creates,
+            "recommended_query_runs": recommended_query_runs,
+            "custom_query_runs": custom_query_runs,
+            "avg_endpoints_per_query": avg_endpoints_per_query,
+            "queried_os_breakdown": dict(os_counter),
+            "users_query_creates": users_rows,
+            "top_queries": top_queries,
+            "daily_event_counts": dict(sorted(daily_event_counts.items(), key=lambda kv: kv[0])),
+            "known_recommended_names": sorted(known_recommended),
+        }
+
+    def _event_is_live_query(event: dict[str, Any]) -> bool:
+        desc = str(_pick_value(event, ["description", "message", "details"], "")).lower()
+        request_url = str(_pick_value(event, ["request_url", "requestUrl", "request_uri", "requestURI"], "")).lower()
+        if "ran query:" in desc:
+            return True
+        if " query " in desc and ("schedule" in desc or "created" in desc or "deleted" in desc or "stopped" in desc):
+            return True
+        if "livequery" in request_url or "/runs/" in request_url or "/templates/" in request_url:
+            return True
+        return False
+
+    def _parse_query_name(desc: str) -> str:
+        match = re.search(r"Ran query:\s*(.+)", desc, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        match = re.search(r"Query\s+(.+?)\s+(?:schedule\s+)?(?:created|deleted|stopped)", desc, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        match = re.search(r"(?:Created query|Query created):\s*(.+)", desc, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        return "Unknown"
+
+    def _parse_action(desc: str) -> str:
+        d = desc.lower()
+        if "ran query:" in d:
+            return "run"
+        if "schedule" in d and "created" in d:
+            return "schedule_created"
+        if "schedule" in d and "deleted" in d:
+            return "schedule_deleted"
+        if "schedule" in d and "stopped" in d:
+            return "schedule_stopped"
+        if "query" in d and "created" in d:
+            return "created"
+        return "other"
+
+    def _parse_os(desc: str, query_name: str) -> list[str]:
+        text = f"{desc} {query_name}".lower()
+        os_hits: list[str] = []
+        if "windows" in text or " win " in text:
+            os_hits.append("Windows")
+        if "linux" in text:
+            os_hits.append("Linux")
+        if "mac" in text or "osx" in text:
+            os_hits.append("macOS")
+        return os_hits
+
+    def _parse_endpoints_count(desc: str) -> int | None:
+        match = re.search(r"(\d+)\s*(?:endpoints|endpoint|devices|device)", desc, re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+
+    api_summary = _summarize_from_api(live_query_activity or {})
+    if _safe_int(api_summary.get("total_query_runs", 0)) > 0:
+        return api_summary
+
+    audit_summary = _summarize_from_audit(audit_logs)
+    if _safe_int(audit_summary.get("total_live_query_events", 0)) > 0:
+        return audit_summary
+
+    return _empty_payload("none")
+
+
 def summarize_permissions_rule_audit(policy_rules: list[dict[str, Any]]) -> dict[str, Any]:
     broad_rules = 0
     disabled_rules = 0

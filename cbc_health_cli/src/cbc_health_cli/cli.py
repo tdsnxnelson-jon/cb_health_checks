@@ -18,6 +18,7 @@ from cbc_health_cli.checks import (
     summarize_daily_alert_trends,
     summarize_devices,
     summarize_endpoint_status,
+    summarize_live_query_audit_remediation,
     summarize_permissions_rule_audit,
     summarize_policy_efficacy,
     summarize_policy_drift,
@@ -319,6 +320,7 @@ def run_command(args: argparse.Namespace) -> int:
     core_prevention_rules: list[dict[str, Any]] = []
     watchlists: list[dict[str, Any]] = []
     audit_logs: list[dict[str, Any]] = []
+    live_query_activity: dict[str, Any] = {}
     ngav_enabled = True
 
     users: list[dict[str, Any]] = []
@@ -529,6 +531,27 @@ def run_command(args: argparse.Namespace) -> int:
         audit_logs = client.get_audit_logs(backend_url, tenant_key, tenant_id=tenant_id)
     except Exception as exc:
         summary["warnings"].append(f"audit log API unavailable: {exc}")
+    status.advance("Starting live query API collection")
+
+    entitlement_products_for_lq = _products_from_entitlements(org_entitlements)
+    live_query_entitled = entitlement_products_for_lq is not None and "Live Query" in entitlement_products_for_lq
+
+    if live_query_entitled:
+        try:
+            live_query_activity = client.get_live_query_activity(backend_url, tenant_key)
+        except Exception as exc:
+            summary["warnings"].append(f"live query API unavailable (falling back to audit logs): {exc}")
+    else:
+        if entitlement_products_for_lq is None:
+            summary["checks"]["live_query_audit_remediation"] = {
+                "status": "not_applicable",
+                "reason": "Live Query entitlement could not be confirmed from entitlements API",
+            }
+        else:
+            summary["checks"]["live_query_audit_remediation"] = {
+                "status": "not_applicable",
+                "reason": "Live Query entitlement is not enabled for this org",
+            }
     status.advance("Starting user list collection")
 
     try:
@@ -557,6 +580,15 @@ def run_command(args: argparse.Namespace) -> int:
     except Exception as exc:
         summary["checks"]["api_connector_use"] = {"status": "error"}
         summary["errors"].append(f"api connector check failed: {exc}")
+    status.advance("Starting live query audit/remediation check")
+
+    if live_query_entitled:
+        try:
+            lq = summarize_live_query_audit_remediation(live_query_activity, audit_logs)
+            summary["checks"]["live_query_audit_remediation"] = {"status": "ok", "summary": lq}
+        except Exception as exc:
+            summary["checks"]["live_query_audit_remediation"] = {"status": "error"}
+            summary["errors"].append(f"live query audit/remediation check failed: {exc}")
     status.advance("Starting permissions rule audit")
 
     try:

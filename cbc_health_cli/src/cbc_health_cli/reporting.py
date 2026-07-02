@@ -958,6 +958,113 @@ def _daily_alert_trend_data(daily_counts: dict[str, Any], max_points: int = 45) 
     return categories, values
 
 
+def _add_live_query_audit_slide(prs: Presentation, live_query: dict[str, Any]) -> None:
+    """Render Live Query (Audit and Remediation) analytics slide."""
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _add_background(slide, "F8FAFC")
+    _add_section_header(
+        slide,
+        "Live Query (Audit and Remediation)",
+        "Who ran queries, what was queried, and how activity trends over time.",
+    )
+
+    total_events = int(_to_numeric(live_query.get("total_live_query_events", 0)))
+    total_runs = int(_to_numeric(live_query.get("total_query_runs", 0)))
+    recommended_runs = int(_to_numeric(live_query.get("recommended_query_runs", 0)))
+    custom_runs = int(_to_numeric(live_query.get("custom_query_runs", 0)))
+    avg_endpoints_raw = live_query.get("avg_endpoints_per_query")
+    if isinstance(avg_endpoints_raw, (int, float)):
+        avg_endpoints = f"{avg_endpoints_raw:.2f}"
+    else:
+        avg_endpoints = "n/a"
+
+    _add_card(slide, 0.65, 1.2, 2.45, 1.2, "Live Query Events", _format_count(total_events), "audit log entries", accent="2563EB")
+    _add_card(slide, 3.25, 1.2, 2.45, 1.2, "Query Runs", _format_count(total_runs), "run actions", accent="0F766E")
+    _add_card(slide, 5.85, 1.2, 2.55, 1.2, "Recommended", _format_count(recommended_runs), "runs", accent="22C55E")
+    _add_card(slide, 8.55, 1.2, 2.55, 1.2, "Custom", _format_count(custom_runs), "runs", accent="DC2626")
+
+    creators = live_query.get("users_query_creates", []) if isinstance(live_query, dict) else []
+    creator_rows: list[list[Any]] = []
+    if isinstance(creators, list):
+        for entry in creators[:10]:
+            if not isinstance(entry, dict):
+                continue
+            creator_rows.append([
+                str(entry.get("user", "unknown")),
+                int(_to_numeric(entry.get("run_count", entry.get("create_count", 0)))),
+            ])
+    _add_table(
+        slide,
+        0.65,
+        2.65,
+        3.95,
+        2.45,
+        ["User", "Runs"],
+        creator_rows or [["No run events", 0]],
+    )
+
+    top_queries = live_query.get("top_queries", []) if isinstance(live_query, dict) else []
+    query_rows: list[list[Any]] = []
+    if isinstance(top_queries, list):
+        for entry in top_queries[:8]:
+            if not isinstance(entry, dict):
+                continue
+            query_rows.append([
+                str(entry.get("query_name", "Unknown")),
+                int(_to_numeric(entry.get("run_count", 0))),
+                str(entry.get("query_type", "Unknown")),
+                str(entry.get("os", "Unknown")),
+            ])
+    _add_table(
+        slide,
+        4.8,
+        2.65,
+        7.85,
+        2.45,
+        ["Query", "Runs", "Type", "OS"],
+        query_rows or [["No query run events", 0, "n/a", "n/a"]],
+    )
+
+    os_breakdown = live_query.get("queried_os_breakdown", {}) if isinstance(live_query, dict) else {}
+    os_items = _sorted_mapping_items(os_breakdown, limit=5, sort_by_value=True)
+    _add_doughnut_chart(
+        slide,
+        0.65,
+        5.2,
+        4.6,
+        2.0,
+        f"Queried OS Mix (avg endpoints/query: {avg_endpoints})",
+        [name for name, _ in os_items],
+        [value for _, value in os_items],
+        series_name="Runs",
+    )
+
+    daily_counts = live_query.get("daily_event_counts", {}) if isinstance(live_query, dict) else {}
+    trend_labels, trend_values = _daily_alert_trend_data(daily_counts, max_points=30)
+    _add_line_chart(
+        slide,
+        5.4,
+        5.2,
+        7.25,
+        2.0,
+        "Live Query Event Timeline",
+        trend_labels,
+        trend_values,
+        series_name="Events/day",
+    )
+
+    _add_textbox(
+        slide,
+        0.65,
+        7.16,
+        12.0,
+        0.2,
+        "Recommended vs custom classification uses recommended_query_id (non-null => Recommended).",
+        font_size=8,
+        color=_hex_color("55606E"),
+    )
+
+
 def _rows_from_mapping(mapping: dict[str, Any], limit: int = 8) -> list[list[Any]]:
     if not isinstance(mapping, dict):
         return []
@@ -1429,6 +1536,7 @@ def write_executive_pptx(run_dir: Path) -> Path:
     alert_quality = _get_check_summary(summary, "alert_quality")
     user_logins = _get_check_summary(summary, "user_logins")
     policy_efficacy = _get_check_summary(summary, "policy_efficacy")
+    live_query = _get_check_summary(summary, "live_query_audit_remediation")
     pending_appendix_links: list[tuple[Any, str]] = []
 
     appendix_started = False
@@ -1565,6 +1673,11 @@ def write_executive_pptx(run_dir: Path) -> Path:
     if alerts_api_total > alerts_processed and alerts_processed > 0:
         trend_title = f"Daily Alerts Trend (sampled {_format_count(alerts_processed)} of {_format_count(alerts_api_total)})"
     _add_line_chart(slide, 0.65, 4.35, 7.65, 2.05, trend_title, trend_labels, trend_values, series_name="Alerts/day")
+
+    live_query_check = summary.get("checks", {}).get("live_query_audit_remediation", {})
+    live_query_status = str(live_query_check.get("status", "")).strip().lower() if isinstance(live_query_check, dict) else ""
+    if live_query_status == "ok":
+        _add_live_query_audit_slide(prs, live_query)
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "FFFFFF")
@@ -1881,6 +1994,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
     alert_quality = _get_check_summary(summary, "alert_quality")
     policy_efficacy = _get_check_summary(summary, "policy_efficacy")
     permissions_rule_audit = _get_check_summary(summary, "permissions_rule_audit")
+    live_query = _get_check_summary(summary, "live_query_audit_remediation")
     pending_appendix_links: list[tuple[Any, str]] = []
 
     appendix_started = False
@@ -1997,13 +2111,20 @@ def write_technical_pptx(run_dir: Path) -> Path:
         status_counts[str(status)] = status_counts.get(str(status), 0) + 1
     total_checks = len(check_rows)
     reliability_ratio = (status_counts.get("ok", 0) / total_checks) if total_checks else 0.0
+    run_status_display = {
+        "error": "RUN ERROR",
+        "unavailable": "UNAVAILABLE",
+        "ok": "RUN OK",
+        "not_applicable": "NOT APPLICABLE",
+        "unknown": "UNKNOWN",
+    }
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "F8FAFC")
     _add_section_header(
         slide,
         "Run Reliability Overview",
-        "Status concentration and action-required checks for this run.",
+        "Run execution status concentration and action-required checks for this run.",
     )
     _add_card(
         slide,
@@ -2013,7 +2134,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
         1.15,
         "Checks Evaluated",
         _format_count(total_checks),
-        f"Run reliability {reliability_ratio:.0%}",
+        f"Run-OK ratio {reliability_ratio:.0%}",
         accent="2563EB",
     )
     _add_card(
@@ -2033,13 +2154,13 @@ def write_technical_pptx(run_dir: Path) -> Path:
         1.35,
         4.1,
         1.15,
-        "Healthy Checks",
+        "Run-OK Checks",
         _format_count(status_counts.get("ok", 0)),
         f"N/A {status_counts.get('not_applicable', 0)} | Unknown {status_counts.get('unknown', 0)}",
         accent="16A34A",
     )
 
-    status_labels = ["Error", "Unavailable", "OK", "N/A", "Unknown"]
+    status_labels = ["Run Error", "Unavailable", "Run OK", "Not Applicable", "Unknown"]
     status_values = [
         float(status_counts.get("error", 0)),
         float(status_counts.get("unavailable", 0)),
@@ -2060,7 +2181,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
     )
 
     action_rows = [
-        [name, status.replace("_", " ").upper(), note if len(note) <= 85 else (note[:82] + "...")]
+        [name, run_status_display.get(status, status.replace("_", " ").upper()), note if len(note) <= 85 else (note[:82] + "...")]
         for name, status, note in check_rows
         if status in {"error", "unavailable"}
     ][:6]
@@ -2071,8 +2192,8 @@ def write_technical_pptx(run_dir: Path) -> Path:
     _add_background(slide, "FFFFFF")
     _add_section_header(
         slide,
-        "Check Outcomes (Prioritized)",
-        "Checks are ordered by urgency: error, unavailable, ok, unknown.",
+        "Check Run Status (Prioritized)",
+        "Run execution outcomes only. Checks are ordered by urgency: error, unavailable, run ok, unknown.",
     )
 
     _add_card(
@@ -2103,7 +2224,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
         1.35,
         2.7,
         0.95,
-        "OK",
+        "Run OK",
         _format_count(status_counts.get("ok", 0)),
         "No immediate action",
         accent=status_colors["ok"],
@@ -2121,7 +2242,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
     )
 
     outcomes_rows_all = [
-        [name, status.replace("_", " ").upper(), note if len(note) <= 110 else (note[:107] + "...")]
+        [name, run_status_display.get(status, status.replace("_", " ").upper()), note if len(note) <= 110 else (note[:107] + "...")]
         for name, status, note in check_rows
     ]
     outcomes_rows = outcomes_rows_all[:TECH_CHECK_OUTCOMES_ROWS_ON_SLIDE]
@@ -2145,7 +2266,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
         pending_appendix_links.append((outcomes_footer, "All Check Outcomes (Page 1/"))
         _queue_appendix_table(
             [
-                [name, status.replace("_", " ").upper(), note if len(note) <= 200 else (note[:197] + "...")]
+                [name, run_status_display.get(status, status.replace("_", " ").upper()), note if len(note) <= 200 else (note[:197] + "...")]
                 for name, status, note in check_rows
             ],
             ["Check", "Status", "Note"],
@@ -2489,6 +2610,11 @@ def write_technical_pptx(run_dir: Path) -> Path:
         ["Connector", "API Access Level Type", "Sessions"],
         connector_rows or [["n/a", "n/a", 0]],
     )
+
+    live_query_check = summary.get("checks", {}).get("live_query_audit_remediation", {})
+    live_query_status = str(live_query_check.get("status", "")).strip().lower() if isinstance(live_query_check, dict) else ""
+    if live_query_status == "ok":
+        _add_live_query_audit_slide(prs, live_query)
 
     watchlist_rows = _watchlist_detail_rows(watchlists.get("watchlist_details", [])) if isinstance(watchlists, dict) else []
     if watchlist_rows:
