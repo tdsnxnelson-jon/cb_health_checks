@@ -22,6 +22,7 @@ from cbc_health_cli.checks import (
     summarize_permissions_rule_audit,
     summarize_policy_efficacy,
     summarize_policy_drift,
+    summarize_policy_tuning_analysis,
     summarize_policy_settings,
     summarize_policy_posture,
     summarize_sensor_coverage_quality,
@@ -263,7 +264,7 @@ def run_command(args: argparse.Namespace) -> int:
 
     run_start = perf_counter()
 
-    status = _RunStatusBar(total_steps=30)
+    status = _RunStatusBar(total_steps=31)
     status.start("Starting health check run")
 
     client = CBCClient(
@@ -664,6 +665,20 @@ def run_command(args: argparse.Namespace) -> int:
     except Exception as exc:
         summary["checks"]["policy_efficacy"] = {"status": "error"}
         summary["errors"].append(f"policy efficacy check failed: {exc}")
+    status.advance("Starting policy tuning analysis")
+
+    if ngav_enabled:
+        try:
+            pta = summarize_policy_tuning_analysis(summary, policies)
+            summary["checks"]["policy_tuning_analysis"] = {"status": "ok", "summary": pta}
+        except Exception as exc:
+            summary["checks"]["policy_tuning_analysis"] = {"status": "error"}
+            summary["errors"].append(f"policy tuning analysis check failed: {exc}")
+    else:
+        summary["checks"]["policy_tuning_analysis"] = {
+            "status": "not_applicable",
+            "reason": "NGAV disabled (EEDR-only tenant); policy tuning maturity analysis is unavailable",
+        }
     status.advance("Starting health score calculation")
 
     if summary["checks"].get("devices", {}).get("status") == "ok" and summary["checks"].get("alerts", {}).get("status") == "ok":

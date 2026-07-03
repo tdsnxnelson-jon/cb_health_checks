@@ -25,6 +25,7 @@ A Docker-free, Windows-native command line tool to run Carbon Black Cloud health
   - sensor coverage quality (stale and unassigned)
   - alert quality (noise, repeats, unresolved aging)
   - policy efficacy by group (combined standard and core prevention posture)
+  - policy tuning analysis (Broadcom Good/Better/Best maturity mapping)
 - Writes outputs to JSON and CSV for easy sharing.
 - Writes a PowerPoint executive summary from `summary.json` for stakeholder sharing.
 - Writes a second technical PowerPoint deck from `summary.json` for engineering review.

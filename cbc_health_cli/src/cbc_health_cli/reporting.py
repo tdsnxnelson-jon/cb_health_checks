@@ -12,6 +12,7 @@ from pptx.dml.color import RGBColor
 from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
 from pptx.enum.text import MSO_VERTICAL_ANCHOR, PP_ALIGN
+from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Inches, Pt
 
 
@@ -103,6 +104,7 @@ def write_executive_markdown(run_dir: Path, summary: dict[str, Any]) -> Path:
     policy = checks.get("policy_posture", {}).get("summary", {})
     watchlists = checks.get("watchlists", {}).get("summary", {})
     drift = checks.get("policy_drift", {}).get("summary", {})
+    policy_tuning = checks.get("policy_tuning_analysis", {}).get("summary", {})
 
     lines.append(f"- Devices: {devices.get('total_devices', 'n/a')} (active 7d ratio: {devices.get('active_ratio_last_7d', 'n/a')})")
     lines.append(f"- Alerts (30d): {alerts.get('total_alerts_30d', 'n/a')} (severity 7+: {alerts.get('high_severity_alerts', 'n/a')})")
@@ -129,6 +131,41 @@ def write_executive_markdown(run_dir: Path, summary: dict[str, Any]) -> Path:
                 f"- Drift highlight: {policy_name} changed_fields={change_count} "
                 f"sample={', '.join(sample_fields) if sample_fields else 'n/a'}"
             )
+    lines.append("")
+
+    lines.append("## Policy Analysis (Good/Better/Best)")
+    lines.append("")
+    if isinstance(policy_tuning, dict) and policy_tuning:
+        framework = str(policy_tuning.get("framework", "Broadcom Endpoint Standard Good-Better-Best"))
+        current_tier = str(policy_tuning.get("current_tier", "unknown"))
+        score = policy_tuning.get("score_0_100", "n/a")
+        applicable = bool(policy_tuning.get("framework_applicable", False))
+        lines.append(f"- Framework: {framework}")
+        lines.append(f"- Current tier: {current_tier}")
+        lines.append(f"- Maturity score: {score}")
+        lines.append(f"- Applicable: {'yes' if applicable else 'no'}")
+
+        metrics = policy_tuning.get("metrics", {})
+        if isinstance(metrics, dict):
+            lines.append(
+                "- Metrics: "
+                f"fully_alert_only_policies={metrics.get('fully_alert_only_policies', 'n/a')}, "
+                f"missing_required_controls={metrics.get('policies_with_missing_required_controls', 'n/a')}, "
+                f"monitor_heavy_policy_groups={metrics.get('monitor_heavy_policy_groups', 'n/a')}, "
+                f"permissions_p1={metrics.get('permissions_audit_p1_policies', 'n/a')}"
+            )
+
+        top_gaps = policy_tuning.get("top_gaps", [])
+        if isinstance(top_gaps, list) and top_gaps:
+            for gap in top_gaps[:4]:
+                lines.append(f"- Gap: {gap}")
+
+        next_actions = policy_tuning.get("next_actions", [])
+        if isinstance(next_actions, list) and next_actions:
+            for action in next_actions[:3]:
+                lines.append(f"- Next action: {action}")
+    else:
+        lines.append("- Policy tuning analysis unavailable.")
     lines.append("")
 
     lines.append("## Prioritized Recommendations")
@@ -519,9 +556,9 @@ def _add_bullet_list(
 
     for index, line in enumerate(lines):
         paragraph = frame.paragraphs[0] if index == 0 else frame.add_paragraph()
-        paragraph.text = line
+        paragraph.text = f"• {line}"
         paragraph.level = 0
-        paragraph.bullet = True
+        paragraph.bullet = False
         paragraph.space_after = Pt(7)
         if paragraph.runs:
             run = paragraph.runs[0]
@@ -586,6 +623,13 @@ def _safe_str(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=True)
     return str(value)
+
+
+def _truncate_chart_label(value: Any, max_length: int = 32) -> str:
+    text = _safe_str(value).strip()
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 3].rstrip() + "..."
 
 
 def _appendix_rows_per_slide(headers: list[str]) -> int:
@@ -788,6 +832,34 @@ def _style_chart_data_labels(labels: Any, font_size: int = 8) -> None:
     labels.font.color.rgb = _hex_color("1F2937")
 
 
+def _force_all_category_tick_labels(chart: Any) -> None:
+    # PowerPoint can auto-skip category labels on dense bar charts.
+    # Set the XML skip markers directly so every category is eligible for display.
+    try:
+        category_axis = chart.category_axis
+        category_axis.tick_label_spacing = 1
+    except Exception:
+        pass
+
+    try:
+        cat_ax_elements = chart._chartSpace.xpath(".//c:catAx")
+    except Exception:
+        cat_ax_elements = []
+
+    for cat_ax in cat_ax_elements:
+        for tag_name in ("c:tickLblSkip", "c:tickMarkSkip"):
+            try:
+                existing_nodes = cat_ax.xpath(f"./{tag_name}")
+                if existing_nodes:
+                    existing = existing_nodes[0]
+                else:
+                    existing = OxmlElement(tag_name)
+                    cat_ax.append(existing)
+                existing.set("val", "1")
+            except Exception:
+                continue
+
+
 def _add_column_chart(
     slide,
     left: float,
@@ -834,6 +906,8 @@ def _add_bar_chart(
     *,
     series_name: str = "Count",
     show_data_labels: bool = True,
+    category_font_size: int = 10,
+    value_font_size: int = 9,
 ) -> None:
     if not categories or not values:
         _add_unavailable_callout(slide, left, top, width, height, title, "No chart data available")
@@ -849,7 +923,14 @@ def _add_bar_chart(
         Inches(height),
         chart_data,
     ).chart
-    _apply_chart_theme(chart, title, show_legend=False, category_font_size=10, value_font_size=9)
+    _apply_chart_theme(
+        chart,
+        title,
+        show_legend=False,
+        category_font_size=category_font_size,
+        value_font_size=value_font_size,
+    )
+    _force_all_category_tick_labels(chart)
     chart.value_axis.has_major_gridlines = True
     if show_data_labels:
         chart.plots[0].has_data_labels = True
@@ -1270,6 +1351,230 @@ def _dormant_recommendation_appendix_data(
     return None
 
 
+def _is_policy_recommendation(rec: dict[str, Any]) -> bool:
+    area = str(rec.get("area", "")).strip().lower()
+    if not area:
+        return False
+    if "policy" in area:
+        return True
+    return area in {"core prevention", "permissions rule audit"}
+
+
+def _recommendation_rows(recommendations: Any, *, policy_only: bool | None = None) -> list[list[Any]]:
+    if not isinstance(recommendations, list):
+        return []
+
+    rows: list[list[Any]] = []
+    for rec in recommendations:
+        if not isinstance(rec, dict):
+            continue
+        is_policy = _is_policy_recommendation(rec)
+        if policy_only is True and not is_policy:
+            continue
+        if policy_only is False and is_policy:
+            continue
+        rows.append(
+            [
+                rec.get("priority", "P4"),
+                rec.get("area", "General"),
+                rec.get("recommendation", ""),
+                rec.get("evidence", ""),
+            ]
+        )
+    return rows
+
+
+def _policy_summary_row(policy_tuning: dict[str, Any], policy_rec_count: int) -> list[Any] | None:
+    if not isinstance(policy_tuning, dict) or policy_rec_count <= 0:
+        return None
+
+    current_tier = str(policy_tuning.get("current_tier", "unknown"))
+    score = policy_tuning.get("score_0_100", "n/a")
+    top_gaps = policy_tuning.get("top_gaps", [])
+    if isinstance(top_gaps, list) and top_gaps:
+        gap_hint = str(top_gaps[0])
+    else:
+        gap_hint = "See appendix for detailed policy actions"
+
+    return [
+        "P2",
+        "Policy Summary",
+        f"Policy maturity tier is {current_tier} (score {score}/100). Detailed policy recommendations are in the appendix.",
+        f"policy_recommendations={policy_rec_count}; top_gap={gap_hint}",
+    ]
+
+
+def _policy_maturity_action_plan_items(policy_tuning: dict[str, Any], *, attention_only: bool = True) -> list[dict[str, Any]]:
+    if not isinstance(policy_tuning, dict):
+        return []
+
+    key = "policy_maturity_action_plan" if attention_only else "policy_maturity_action_plan_all"
+    plan = policy_tuning.get(key, [])
+    if not isinstance(plan, list):
+        return []
+
+    items: list[dict[str, Any]] = []
+    for item in plan:
+        if not isinstance(item, dict):
+            continue
+        actions_raw = item.get("actions", [])
+        if isinstance(actions_raw, list):
+            actions = [str(action).strip() for action in actions_raw if str(action).strip()]
+        elif str(actions_raw).strip():
+            actions = [str(actions_raw).strip()]
+        else:
+            actions = []
+        items.append(
+            {
+                "policy_name": str(item.get("policy_name", "unknown")),
+                "assigned_endpoints": int(_to_numeric(item.get("assigned_endpoints", 0))),
+                "current_tier": str(item.get("current_tier", "unknown")).upper(),
+                "next_target": str(item.get("next_target", "maintain")).upper(),
+                "actions": actions,
+            }
+        )
+    return items
+
+
+def _policy_maturity_action_rows(policy_tuning: dict[str, Any], *, attention_only: bool = True) -> list[list[Any]]:
+    items = _policy_maturity_action_plan_items(policy_tuning, attention_only=attention_only)
+
+    rows: list[list[Any]] = []
+    for item in items:
+        actions_text = "; ".join(item.get("actions", []))
+        rows.append(
+            [
+                str(item.get("policy_name", "unknown")),
+                int(_to_numeric(item.get("assigned_endpoints", 0))),
+                str(item.get("current_tier", "unknown")).upper(),
+                str(item.get("next_target", "maintain")).upper(),
+                actions_text or "No action required.",
+            ]
+        )
+    return rows
+
+
+def _add_policy_maturity_action_block(
+    slide,
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+    item: dict[str, Any],
+) -> None:
+    block = slide.shapes.add_shape(
+        MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+        Inches(left),
+        Inches(top),
+        Inches(width),
+        Inches(height),
+    )
+    block.fill.solid()
+    block.fill.fore_color.rgb = _hex_color("F8FAFC")
+    block.line.color.rgb = _hex_color("CBD5E1")
+    block.line.width = Pt(1)
+
+    policy_name = str(item.get("policy_name", "unknown"))
+    assigned_endpoints = _format_count(item.get("assigned_endpoints", 0))
+    current_tier = str(item.get("current_tier", "UNKNOWN"))
+    next_target = str(item.get("next_target", "MAINTAIN"))
+    actions = item.get("actions", []) if isinstance(item.get("actions", []), list) else []
+    actions_to_show = [str(action).strip() for action in actions if str(action).strip()][:4]
+    if not actions_to_show:
+        actions_to_show = ["No action required."]
+
+    _add_textbox(
+        slide,
+        left + 0.18,
+        top + 0.12,
+        width - 0.36,
+        0.32,
+        policy_name,
+        font_size=14,
+        bold=True,
+        color=_hex_color("102033"),
+    )
+    _add_textbox(
+        slide,
+        left + 0.18,
+        top + 0.48,
+        width - 0.36,
+        0.26,
+        f"Assigned endpoints: {assigned_endpoints}   |   {current_tier} -> {next_target}",
+        font_size=10,
+        color=_hex_color("475569"),
+    )
+    _add_bullet_list(
+        slide,
+        left + 0.18,
+        top + 0.82,
+        width - 0.36,
+        height - 0.94,
+        actions_to_show,
+        font_size=10,
+        color=_hex_color("23313F"),
+    )
+
+
+def _paginate_policy_maturity_action_plan(
+    prs: Presentation,
+    items: list[dict[str, Any]],
+    title: str,
+    items_per_slide: int = 2,
+) -> int:
+    if not items:
+        return 0
+
+    slides_created = 0
+
+    summary_rows: list[list[Any]] = []
+    summary_items = sorted(
+        items,
+        key=lambda item: (
+            -int(_to_numeric(item.get("assigned_endpoints", 0))),
+            str(item.get("policy_name", "")).lower(),
+        ),
+    )
+    for item in summary_items:
+        summary_rows.append(
+            [
+                str(item.get("policy_name", "unknown")),
+                str(item.get("current_tier", "UNKNOWN")).upper(),
+                int(_to_numeric(item.get("assigned_endpoints", 0))),
+            ]
+        )
+    slides_created += _paginate_table_to_slides(
+        prs,
+        summary_rows,
+        ["Policy", "Maturity Tier", "Assigned Endpoints"],
+        f"{title} - Summary",
+        rows_per_slide=max(20, len(summary_rows)),
+    )
+
+    for page_idx in range(0, len(items), items_per_slide):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        _add_background(slide, "FFFFFF")
+        page_num = (page_idx // items_per_slide) + 1
+        total_pages = (len(items) + items_per_slide - 1) // items_per_slide
+        page_title = f"{title} (Page {page_num}/{total_pages})"
+        _add_section_header(
+            slide,
+            page_title,
+            "Action-plan appendix view: per-policy next step bullets are shown instead of a compressed table.",
+        )
+
+        page_items = items[page_idx : page_idx + items_per_slide]
+        positions = [
+            (0.65, 1.45),
+            (0.65, 4.1),
+        ]
+        for item, (left, top) in zip(page_items, positions):
+            _add_policy_maturity_action_block(slide, left, top, 12.0, 2.5, item)
+        slides_created += 1
+
+    return slides_created
+
+
 def _paginate_table_to_slides(
     prs: Presentation,
     all_rows: list[list[Any]],
@@ -1536,6 +1841,7 @@ def write_executive_pptx(run_dir: Path) -> Path:
     alert_quality = _get_check_summary(summary, "alert_quality")
     user_logins = _get_check_summary(summary, "user_logins")
     policy_efficacy = _get_check_summary(summary, "policy_efficacy")
+    policy_tuning = _get_check_summary(summary, "policy_tuning_analysis")
     live_query = _get_check_summary(summary, "live_query_audit_remediation")
     pending_appendix_links: list[tuple[Any, str]] = []
 
@@ -1785,6 +2091,94 @@ def write_executive_pptx(run_dir: Path) -> Path:
     )
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _add_background(slide, "FFFFFF")
+    _add_section_header(
+        slide,
+        "Policy Analysis (Good/Better/Best)",
+        "High-level maturity view. Detailed policy actions are in the appendix.",
+    )
+
+    current_tier = str(policy_tuning.get("current_tier", "unknown")).upper()
+    score = policy_tuning.get("score_0_100", "n/a")
+    review_cadence = str(policy_tuning.get("review_cadence", "quarterly_or_biannual")).replace("_", " ")
+    policy_metrics = policy_tuning.get("metrics", {}) if isinstance(policy_tuning, dict) else {}
+
+    _add_card(slide, 0.65, 1.25, 2.9, 1.15, "Maturity Tier", current_tier, "framework status", accent="0F766E")
+    _add_card(slide, 3.8, 1.25, 2.9, 1.15, "Policy Score", str(score), "0-100", accent="2563EB")
+    _add_card(
+        slide,
+        6.95,
+        1.25,
+        2.9,
+        1.15,
+        "Gaps",
+        _format_count(policy_metrics.get("policies_with_enforcement_gaps", 0)),
+        "policies",
+        accent="DC2626",
+    )
+    _add_card(slide, 10.1, 1.25, 2.55, 1.15, "Review Cadence", review_cadence, "recommended", accent="7C3AED", value_font_size_max=14)
+
+    gates = policy_tuning.get("gates", {}) if isinstance(policy_tuning, dict) else {}
+    gate_rows: list[list[Any]] = []
+    for gate_name in ["good", "better", "best"]:
+        gate = gates.get(gate_name, {}) if isinstance(gates, dict) else {}
+        passed = bool(gate.get("pass", False)) if isinstance(gate, dict) else False
+        criteria = str(gate.get("criteria", "n/a")) if isinstance(gate, dict) else "n/a"
+        gate_rows.append([gate_name.upper(), "MET" if passed else "NOT MET", criteria])
+
+    _add_table(
+        slide,
+        0.65,
+        2.65,
+        12.0,
+        1.9,
+        ["Tier Gate", "Gate Status", "Criteria"],
+        gate_rows or [["n/a", "n/a", "Policy tuning analysis unavailable."]],
+    )
+
+    top_gaps = policy_tuning.get("top_gaps", []) if isinstance(policy_tuning, dict) else []
+    next_actions = policy_tuning.get("next_actions", []) if isinstance(policy_tuning, dict) else []
+    gap_rows = [["Gap", str(item)] for item in (top_gaps[:3] if isinstance(top_gaps, list) else [])]
+    gap_rows.extend([["Action", str(item)] for item in (next_actions[:3] if isinstance(next_actions, list) else [])])
+    _add_table(
+        slide,
+        0.65,
+        4.75,
+        12.0,
+        2.0,
+        ["Type", "Detail"],
+        gap_rows or [["Info", "No policy gaps/actions were generated."]],
+    )
+
+    policy_rec_rows_exec = _recommendation_rows(summary.get("recommendations", []), policy_only=True)
+    if policy_rec_rows_exec:
+        policy_analysis_footer = _add_textbox(
+            slide,
+            0.65,
+            7.05,
+            9.8,
+            0.18,
+            f"{len(policy_rec_rows_exec)} detailed policy recommendations are available in the appendix. Click to open.",
+            font_size=8,
+            color=_hex_color("2563EB"),
+            underline=True,
+        )
+        pending_appendix_links.append((policy_analysis_footer, "Policy Recommendations (Page 1/"))
+
+    policy_plan_items_exec = _policy_maturity_action_plan_items(policy_tuning, attention_only=True)
+    if policy_plan_items_exec:
+        _add_textbox(
+            slide,
+            0.65,
+            6.84,
+            11.2,
+            0.18,
+            f"{len(policy_plan_items_exec)} policies need maturity attention. Per-policy action-plan appendix is available only in the technical deck.",
+            font_size=8,
+            color=_hex_color("55606E"),
+        )
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "F8FAFC")
     _add_section_header(slide, "Operational Risk Areas", "These are the places where the environment drifts from healthy to annoying, noisy, or slow to respond.")
 
@@ -1849,20 +2243,19 @@ def write_executive_pptx(run_dir: Path) -> Path:
     _add_section_header(slide, "Prioritized Recommendations", "A compact list of the highest-value next actions. This is the slide people forward.")
 
     recommendations = summary.get("recommendations", [])
-    recommendation_rows_all: list[list[Any]] = []
-    if isinstance(recommendations, list):
-        for rec in recommendations:
-            if not isinstance(rec, dict):
-                continue
-            recommendation_rows_all.append([
-                rec.get("priority", "P4"),
-                rec.get("area", "General"),
-                rec.get("recommendation", ""),
-                rec.get("evidence", ""),
-            ])
+    recommendation_rows_all = _recommendation_rows(recommendations)
+    policy_recommendation_rows = _recommendation_rows(recommendations, policy_only=True)
+    non_policy_recommendation_rows = _recommendation_rows(recommendations, policy_only=False)
+
+    policy_summary_row = _policy_summary_row(policy_tuning, len(policy_recommendation_rows))
+    recommendation_rows_main = list(non_policy_recommendation_rows)
+    if policy_summary_row is not None:
+        recommendation_rows_main.insert(0, policy_summary_row)
+    if not recommendation_rows_main:
+        recommendation_rows_main = recommendation_rows_all
 
     rec_rows: list[list[Any]] = []
-    rec_rows = recommendation_rows_all[:EXEC_RECOMMENDATIONS_ROWS_ON_SLIDE]
+    rec_rows = recommendation_rows_main[:EXEC_RECOMMENDATIONS_ROWS_ON_SLIDE]
     
     total_recs = len([r for r in recommendations if isinstance(r, dict)]) if isinstance(recommendations, list) else 0
     shown_recs = len(rec_rows)
@@ -1880,6 +2273,25 @@ def write_executive_pptx(run_dir: Path) -> Path:
     recs_footnote = _add_sampling_footnote(slide, total_recs, shown_recs, y_position=6.35)
     if total_recs > shown_recs and recs_footnote is not None:
         pending_appendix_links.append((recs_footnote, "Detailed Recommendations (Page 1/"))
+
+    if policy_recommendation_rows:
+        policy_footer = _add_textbox(
+            slide,
+            0.62,
+            6.15,
+            10.8,
+            0.18,
+            f"{len(policy_recommendation_rows)} policy recommendations are summarized here and detailed in the appendix. Click to open full policy recommendation list.",
+            font_size=8,
+            color=_hex_color("2563EB"),
+            underline=True,
+        )
+        pending_appendix_links.append((policy_footer, "Policy Recommendations (Page 1/"))
+        _queue_appendix_table(
+            policy_recommendation_rows,
+            ["Priority", "Area", "Recommendation", "Evidence"],
+            "Policy Recommendations",
+        )
 
     dormant_appendix = _dormant_recommendation_appendix_data(recommendations, user_logins)
     if dormant_appendix is not None:
@@ -1993,12 +2405,14 @@ def write_technical_pptx(run_dir: Path) -> Path:
     sensor_quality = _get_check_summary(summary, "sensor_coverage_quality")
     alert_quality = _get_check_summary(summary, "alert_quality")
     policy_efficacy = _get_check_summary(summary, "policy_efficacy")
+    policy_tuning = _get_check_summary(summary, "policy_tuning_analysis")
     permissions_rule_audit = _get_check_summary(summary, "permissions_rule_audit")
     live_query = _get_check_summary(summary, "live_query_audit_remediation")
     pending_appendix_links: list[tuple[Any, str]] = []
 
     appendix_started = False
     appendix_tables: list[tuple[list[list[Any]], list[str], str, int]] = []
+    appendix_action_plans: list[tuple[list[dict[str, Any]], str]] = []
 
     def _start_appendix() -> None:
         nonlocal appendix_started
@@ -2018,6 +2432,10 @@ def write_technical_pptx(run_dir: Path) -> Path:
             if effective_rows_per_slide is None:
                 effective_rows_per_slide = _appendix_rows_per_slide(headers)
             appendix_tables.append((all_rows, headers, title, effective_rows_per_slide))
+
+    def _queue_policy_maturity_action_plan(items: list[dict[str, Any]], title: str) -> None:
+        if items:
+            appendix_action_plans.append((items, title))
 
     _add_standard_cover_slide(
         prs,
@@ -2275,7 +2693,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "FFFFFF")
-    _add_section_header(slide, "Devices, Alerts, and Trends", "Time-series first, then breakout by platform and severity.")
+    _add_section_header(slide, "Alert Volume and Mix", "Alert trend and mix stay together; endpoint platform posture is separated onto the next slide.")
     endpoint_counts = endpoint_status.get("status_counts", {}) if isinstance(endpoint_status, dict) else {}
     active_or_bypass_devices = int(
         _to_numeric(endpoint_counts.get("ACTIVE", 0))
@@ -2313,25 +2731,12 @@ def write_technical_pptx(run_dir: Path) -> Path:
         _tech_trend_title = f"Daily Alerts (sampled {_format_count(_tech_alerts_processed)} of {_format_count(_tech_alerts_api_total)})"
     _add_line_chart(slide, 0.65, 2.65, 7.25, 3.8, _tech_trend_title, trend_labels, trend_values, series_name="Alerts/day")
 
-    os_items = _sorted_mapping_items(devices.get("os_breakdown", {}), limit=6, sort_by_value=True)
-    _add_doughnut_chart(
-        slide,
-        8.15,
-        2.65,
-        2.25,
-        1.85,
-        "OS Mix",
-        [name for name, _ in os_items],
-        [value for _, value in os_items],
-        series_name="Devices",
-    )
-
     severity_items = _sorted_mapping_items(alerts.get("severity_breakdown", {}), limit=6, sort_by_value=True)
     _add_column_chart(
         slide,
-        10.55,
+        8.15,
         2.65,
-        2.15,
+        4.55,
         1.85,
         "Top Severities",
         [name for name, _ in severity_items],
@@ -2351,6 +2756,92 @@ def write_technical_pptx(run_dir: Path) -> Path:
         [name for name, _ in alert_type_items],
         [value for _, value in alert_type_items],
         series_name="Alerts",
+    )
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _add_background(slide, "F8FAFC")
+    _add_section_header(slide, "Endpoint Platform and Sensor Health", "Device OS mix and sensor-version spread live together so this reads as fleet posture, not alert context.")
+
+    _add_card(slide, 0.65, 1.2, 2.75, 1.2, "Devices", _format_count(devices.get("total_devices")), f"Active 7d {_format_ratio(devices.get('active_ratio_last_7d'))}", accent="2563EB")
+    _add_card(slide, 3.55, 1.2, 2.75, 1.2, "Active 7d", _format_count(devices.get("active_last_7d")), "reporting recently", accent="0F766E")
+    _add_card(slide, 6.45, 1.2, 2.75, 1.2, "Stale Sensors", _format_count(sensor_quality.get("stale_sensors_over_7d")), "over 7 days", accent="F59E0B")
+    _add_card(slide, 9.35, 1.2, 3.3, 1.2, "Non-active Endpoints", _format_count(endpoint_status.get("non_active_total")), "status exceptions", accent="DC2626")
+
+    os_items = _sorted_mapping_items(devices.get("os_breakdown", {}), limit=6, sort_by_value=True)
+    _add_doughnut_chart(
+        slide,
+        0.65,
+        2.85,
+        5.95,
+        3.35,
+        "Device OS Mix",
+        [name for name, _ in os_items],
+        [value for _, value in os_items],
+        series_name="Devices",
+    )
+
+    sensor_items = _sorted_mapping_items(sensor_quality.get("sensor_version_breakdown", {}), limit=10, sort_by_value=True)
+    _add_bar_chart(
+        slide,
+        6.75,
+        2.85,
+        5.95,
+        3.35,
+        "Top Sensor Versions",
+        [_truncate_chart_label(name, max_length=26) for name, _ in sensor_items],
+        [value for _, value in sensor_items],
+        series_name="Devices",
+        show_data_labels=False,
+        category_font_size=8,
+    )
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _add_background(slide, "FFFFFF")
+    _add_section_header(slide, "Alert Top 10 Breakouts", "This detail belongs in the technical deck: ATT&CK techniques, alerted processes, and reputation mix.")
+
+    attack_technique_items = _sorted_mapping_items(alerts.get("attack_technique_breakdown", {}), limit=10, sort_by_value=True)
+    _add_bar_chart(
+        slide,
+        0.65,
+        1.35,
+        12.05,
+        2.05,
+        "Top 10 Alerted ATT&CK Techniques",
+        [_truncate_chart_label(name, max_length=48) for name, _ in attack_technique_items],
+        [value for _, value in attack_technique_items],
+        series_name="Alerts",
+        show_data_labels=False,
+        category_font_size=8,
+    )
+
+    process_items = _sorted_mapping_items(alerts.get("process_breakdown", {}), limit=10, sort_by_value=True)
+    _add_bar_chart(
+        slide,
+        0.65,
+        3.9,
+        5.95,
+        2.35,
+        "Top 10 Alerted Processes",
+        [_truncate_chart_label(name, max_length=28) for name, _ in process_items],
+        [value for _, value in process_items],
+        series_name="Alerts",
+        show_data_labels=False,
+        category_font_size=8,
+    )
+
+    reputation_items = _sorted_mapping_items(alerts.get("reputation_breakdown", {}), limit=10, sort_by_value=True)
+    _add_bar_chart(
+        slide,
+        6.75,
+        3.9,
+        5.95,
+        2.35,
+        "Top 10 Alert Reputations",
+        [_truncate_chart_label(name, max_length=24) for name, _ in reputation_items],
+        [value for _, value in reputation_items],
+        series_name="Alerts",
+        show_data_labels=False,
+        category_font_size=8,
     )
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
@@ -2441,6 +2932,97 @@ def write_technical_pptx(run_dir: Path) -> Path:
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "FFFFFF")
+    _add_section_header(
+        slide,
+        "Policy Analysis (Good/Better/Best)",
+        "High-level maturity checkpoint in the policy section. Full policy actions live in the appendix.",
+    )
+
+    current_tier = str(policy_tuning.get("current_tier", "unknown")).upper()
+    score = policy_tuning.get("score_0_100", "n/a")
+    review_cadence = str(policy_tuning.get("review_cadence", "quarterly_or_biannual")).replace("_", " ")
+    policy_metrics = policy_tuning.get("metrics", {}) if isinstance(policy_tuning, dict) else {}
+
+    _add_card(slide, 0.65, 1.2, 2.75, 1.2, "Maturity Tier", current_tier, "framework status", accent="0F766E")
+    _add_card(slide, 3.55, 1.2, 2.75, 1.2, "Policy Score", str(score), "0-100", accent="2563EB")
+    _add_card(
+        slide,
+        6.45,
+        1.2,
+        2.75,
+        1.2,
+        "Gaps",
+        _format_count(policy_metrics.get("policies_with_enforcement_gaps", 0)),
+        "policies",
+        accent="DC2626",
+    )
+    _add_card(slide, 9.35, 1.2, 3.3, 1.2, "Review Cadence", review_cadence, "recommended", accent="7C3AED", value_font_size_max=14)
+
+    gates = policy_tuning.get("gates", {}) if isinstance(policy_tuning, dict) else {}
+    gate_rows: list[list[Any]] = []
+    for gate_name in ["good", "better", "best"]:
+        gate = gates.get(gate_name, {}) if isinstance(gates, dict) else {}
+        passed = bool(gate.get("pass", False)) if isinstance(gate, dict) else False
+        criteria = str(gate.get("criteria", "n/a")) if isinstance(gate, dict) else "n/a"
+        gate_rows.append([gate_name.upper(), "MET" if passed else "NOT MET", criteria])
+
+    _add_table(
+        slide,
+        0.65,
+        2.75,
+        12.0,
+        1.9,
+        ["Tier Gate", "Gate Status", "Criteria"],
+        gate_rows or [["n/a", "n/a", "Policy tuning analysis unavailable."]],
+    )
+
+    top_gaps = policy_tuning.get("top_gaps", []) if isinstance(policy_tuning, dict) else []
+    next_actions = policy_tuning.get("next_actions", []) if isinstance(policy_tuning, dict) else []
+    gap_rows = [["Gap", str(item)] for item in (top_gaps[:3] if isinstance(top_gaps, list) else [])]
+    gap_rows.extend([["Action", str(item)] for item in (next_actions[:3] if isinstance(next_actions, list) else [])])
+    _add_table(
+        slide,
+        0.65,
+        4.85,
+        12.0,
+        1.9,
+        ["Type", "Detail"],
+        gap_rows or [["Info", "No policy gaps/actions were generated."]],
+    )
+
+    policy_rec_rows_tech_summary = _recommendation_rows(summary.get("recommendations", []), policy_only=True)
+    if policy_rec_rows_tech_summary:
+        policy_analysis_footer_tech = _add_textbox(
+            slide,
+            0.65,
+            7.05,
+            9.8,
+            0.18,
+            f"{len(policy_rec_rows_tech_summary)} detailed policy recommendations are available in the appendix. Click to open.",
+            font_size=8,
+            color=_hex_color("2563EB"),
+            underline=True,
+        )
+        pending_appendix_links.append((policy_analysis_footer_tech, "Policy Recommendations (Page 1/"))
+
+    policy_plan_items_tech = _policy_maturity_action_plan_items(policy_tuning, attention_only=True)
+    if policy_plan_items_tech:
+        policy_plan_footer_tech = _add_textbox(
+            slide,
+            0.65,
+            6.84,
+            10.8,
+            0.18,
+            f"{len(policy_plan_items_tech)} policies need maturity attention. Click for per-policy next-level action plan.",
+            font_size=8,
+            color=_hex_color("2563EB"),
+            underline=True,
+        )
+        pending_appendix_links.append((policy_plan_footer_tech, "Policy Maturity Action Plan"))
+        _queue_policy_maturity_action_plan(policy_plan_items_tech, "Policy Maturity Action Plan")
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _add_background(slide, "FFFFFF")
     _add_section_header(slide, "Operational Hygiene", "Workflow, sensor, alert noise, user login, and connector hygiene signals.")
     _add_card(slide, 0.65, 1.2, 2.75, 1.2, "Closed Alerts", _format_count(alert_workflow.get("closed_alerts")), f"Median close {_format_count(alert_workflow.get('median_time_to_close_hours'))}h", accent="22C55E")
     _add_card(slide, 3.55, 1.2, 2.75, 1.2, "Open >72h", _format_count(alert_workflow.get("open_alerts_over_72h")), "workflow backlog", accent="EF4444")
@@ -2459,20 +3041,6 @@ def write_technical_pptx(run_dir: Path) -> Path:
         series_name="Alerts",
     )
 
-    stale_sensor_items = _sorted_mapping_items(sensor_quality.get("sensor_version_breakdown", {}), limit=5, sort_by_value=True)
-    _add_column_chart(
-        slide,
-        4.85,
-        2.85,
-        3.95,
-        2.05,
-        "Sensor Versions",
-        [name for name, _ in stale_sensor_items],
-        [value for _, value in stale_sensor_items],
-        series_name="Devices",
-        show_data_labels=False,
-    )
-
     disposition_breakdown = alert_quality.get("disposition_breakdown", {}) if isinstance(alert_quality, dict) else {}
     disposition_items = [
         ("False Positive", _to_numeric(disposition_breakdown.get("False Positive", 0))),
@@ -2481,9 +3049,9 @@ def write_technical_pptx(run_dir: Path) -> Path:
     ]
     _add_pie_chart(
         slide,
-        9.05,
+        4.85,
         2.85,
-        3.65,
+        3.95,
         2.05,
         "Alert Disposition",
         [name for name, _ in disposition_items],
@@ -2667,8 +3235,8 @@ def write_technical_pptx(run_dir: Path) -> Path:
     risk_metric_data = {
         "Old banned hashes": _to_numeric(banned_hashes.get("older_than_365d", 0)),
         "Bypass rules": _to_numeric(permissions_rule_audit.get("bypass_rules", 0)),
-        "Perms P1": _to_numeric(permissions_rule_audit.get("p1_policy_count", 0)),
-        "Perms P2": _to_numeric(permissions_rule_audit.get("p2_policy_count", 0)),
+        "BYPASS Critical (P1)": _to_numeric(permissions_rule_audit.get("p1_policy_count", 0)),
+        "BYPASS High (P2)": _to_numeric(permissions_rule_audit.get("p2_policy_count", 0)),
     }
     risk_items = _sorted_mapping_items(risk_metric_data, limit=6, sort_by_value=False)
     _add_column_chart(
@@ -2744,18 +3312,18 @@ def write_technical_pptx(run_dir: Path) -> Path:
     _add_background(slide, "FFFFFF")
     _add_section_header(slide, "Recommendations", "The generated remediation list, kept in the deck for reference.")
     recommendations = summary.get("recommendations", [])
-    full_rec_rows_tech: list[list[Any]] = []
-    if isinstance(recommendations, list):
-        for rec in recommendations:
-            if isinstance(rec, dict):
-                full_rec_rows_tech.append([
-                    rec.get("priority", "P4"),
-                    rec.get("area", "General"),
-                    rec.get("recommendation", ""),
-                    rec.get("evidence", ""),
-                ])
+    full_rec_rows_tech = _recommendation_rows(recommendations)
+    policy_recommendation_rows_tech = _recommendation_rows(recommendations, policy_only=True)
+    non_policy_recommendation_rows_tech = _recommendation_rows(recommendations, policy_only=False)
 
-    rec_rows = full_rec_rows_tech[:TECH_RECOMMENDATIONS_ROWS_ON_SLIDE]
+    policy_summary_row_tech = _policy_summary_row(policy_tuning, len(policy_recommendation_rows_tech))
+    rec_rows_pool_tech = list(non_policy_recommendation_rows_tech)
+    if policy_summary_row_tech is not None:
+        rec_rows_pool_tech.insert(0, policy_summary_row_tech)
+    if not rec_rows_pool_tech:
+        rec_rows_pool_tech = full_rec_rows_tech
+
+    rec_rows = rec_rows_pool_tech[:TECH_RECOMMENDATIONS_ROWS_ON_SLIDE]
     
     total_recs_tech = len([r for r in recommendations if isinstance(r, dict)]) if isinstance(recommendations, list) else 0
     shown_recs_tech = len(rec_rows)
@@ -2763,6 +3331,25 @@ def write_technical_pptx(run_dir: Path) -> Path:
     _add_table(slide, 0.55, 1.25, 12.2, 5.8, ["Priority", "Area", "Recommendation", "Evidence"], rec_rows or [["n/a", "n/a", "No recommendations were generated.", ""]])
     
     recs_footnote = _add_sampling_footnote(slide, total_recs_tech, shown_recs_tech, y_position=7.18)
+
+    if policy_recommendation_rows_tech:
+        policy_footer_tech = _add_textbox(
+            slide,
+            0.62,
+            7.0,
+            10.8,
+            0.18,
+            f"{len(policy_recommendation_rows_tech)} policy recommendations are in the appendix. Click to open the full policy recommendation table.",
+            font_size=8,
+            color=_hex_color("2563EB"),
+            underline=True,
+        )
+        pending_appendix_links.append((policy_footer_tech, "Policy Recommendations (Page 1/"))
+        _queue_appendix_table(
+            policy_recommendation_rows_tech,
+            ["Priority", "Area", "Recommendation", "Evidence"],
+            "Policy Recommendations",
+        )
 
     dormant_appendix = _dormant_recommendation_appendix_data(recommendations, user_logins)
     if dormant_appendix is not None:
@@ -2791,10 +3378,12 @@ def write_technical_pptx(run_dir: Path) -> Path:
             "Complete Recommendations",
         )
 
-    if appendix_tables:
+    if appendix_tables or appendix_action_plans:
         _start_appendix()
         for all_rows, headers, title, rows_per_slide in appendix_tables:
             _paginate_table_to_slides(prs, all_rows, headers, title, rows_per_slide=rows_per_slide)
+        for items, title in appendix_action_plans:
+            _paginate_policy_maturity_action_plan(prs, items, title)
 
     for shape, title_prefix in pending_appendix_links:
         target_slide = _find_slide_by_title_prefix(prs, title_prefix)

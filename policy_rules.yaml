@@ -1,0 +1,56 @@
+framework: "Broadcom Endpoint Standard Good/Better/Best"
+
+review_practice:
+  test_rule_required_for_enforcement_changes: true
+  bypass_rules_have_no_test_rule_feature: true
+  bypass_rule_review_guidance:
+    - "For P1/P2 BYPASS rules, review and narrow scope using specific binary names, extensions, and paths"
+
+good:
+  minimums:
+    - "Use Test Rule before implementing rule changes in production"
+    - "Core prevention in Alert and block"
+  required_controls:
+    known_malware:
+      - "Runs or is running: DENY/TERMINATE"
+    application_on_company_banned_list:
+      - "Runs or is running: DENY/TERMINATE"
+    unknown_application_or_process:
+      - "Scrapes memory of another process: DENY/TERMINATE"
+      - "Performs ransomware-like behavior: DENY/TERMINATE"
+    adware_or_pup:
+      - "Runs or is running: DENY/TERMINATE"
+    suspected_malware:
+      - "Runs or is running: DENY/TERMINATE"
+    not_listed_application:
+      - "Scrapes memory of another process: DENY/TERMINATE"
+      - "Performs ransomware-like behavior: DENY/TERMINATE"
+
+better:
+  minimums:
+    - "Use Test Rule before implementing rule changes in production"
+    - "Achieve good policy"
+  required_controls:
+    unknown_application_or_process:
+      - "Executes code from memory: DENY/TERMINATE"
+      - "Communicates over the network: DENY/TERMINATE"
+    not_listed_application:
+      - "Invokes an untrusted process: DENY/TERMINATE"
+      - "Executes code from memory: DENY/TERMINATE"
+
+best:
+  minimums:
+    - "Use Test Rule before implementing rule changes in production"
+    - "Achieve better policy"
+    - "At least five policy path-based rules where rules.application.type = NAME_PATH"
+
+gating_rules_to_keep:
+  better_gate:
+    - "No P1 BYPASS wildcard path rule issues"
+    - "Monitor-heavy policy-group ratio <= 20%"
+    - "No missing better-minimum behavior controls"
+  best_gate:
+    - "No P2 BYPASS wildcard path rule issues"
+    - "No monitor-heavy policy groups"
+    - "No unreviewed policy drift"
+    - "At least five NAME_PATH path-based policy rules"
