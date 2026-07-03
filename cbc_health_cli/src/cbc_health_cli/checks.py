@@ -678,6 +678,155 @@ def summarize_watchlists(watchlists: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _alert_watchlist_items(alert: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = alert.get("watchlists")
+    parsed: list[dict[str, Any]] = []
+    if isinstance(raw, list):
+        parsed = [item for item in raw if isinstance(item, dict)]
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            candidate = ast.literal_eval(raw)
+        except Exception:
+            candidate = None
+        if isinstance(candidate, list):
+            parsed = [item for item in candidate if isinstance(item, dict)]
+    return parsed
+
+
+def summarize_watchlist_effectiveness(
+    watchlist_summary: dict[str, Any],
+    alerts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    total_alerts = len(alerts)
+    watchlist_alerts = 0
+    watchlist_high_severity_alerts = 0
+    watchlist_low_severity_alerts = 0
+    watchlist_alert_counts: Counter[str] = Counter()
+
+    for alert in alerts:
+        alert_type = str(_pick_value(alert, ["type", "category", "alert_type"], "")).strip().upper()
+        wl_items = _alert_watchlist_items(alert)
+        is_watchlist_alert = alert_type == "WATCHLIST" or bool(wl_items)
+        if not is_watchlist_alert:
+            continue
+
+        watchlist_alerts += 1
+
+        sev_raw = _pick_value(alert, ["threat_score", "severity", "impact_score"], 0)
+        try:
+            sev = float(sev_raw)
+        except Exception:
+            sev = 0.0
+        if sev >= 7:
+            watchlist_high_severity_alerts += 1
+        if sev < 5:
+            watchlist_low_severity_alerts += 1
+
+        if wl_items:
+            for item in wl_items:
+                wl_id = str(item.get("id", "")).strip()
+                wl_name = str(item.get("name", "")).strip()
+                key = wl_id or wl_name or "unknown_watchlist"
+                watchlist_alert_counts[key] += 1
+        else:
+            watchlist_alert_counts["unattributed_watchlist_alerts"] += 1
+
+    watchlist_alert_ratio = (watchlist_alerts / total_alerts) if total_alerts > 0 else 0.0
+    watchlist_high_ratio = (watchlist_high_severity_alerts / watchlist_alerts) if watchlist_alerts > 0 else 0.0
+    watchlist_low_ratio = (watchlist_low_severity_alerts / watchlist_alerts) if watchlist_alerts > 0 else 0.0
+    top_watchlist_share = 0.0
+    if watchlist_alerts > 0 and watchlist_alert_counts:
+        top_watchlist_share = max(watchlist_alert_counts.values()) / watchlist_alerts
+
+    total_watchlists = int(watchlist_summary.get("total_watchlists", 0)) if isinstance(watchlist_summary, dict) else 0
+    enabled_watchlists = int(watchlist_summary.get("enabled_watchlists", 0)) if isinstance(watchlist_summary, dict) else 0
+    enabled_without_alerting = int(watchlist_summary.get("enabled_without_alerting_watchlists", 0)) if isinstance(watchlist_summary, dict) else 0
+    alerting_enabled_watchlists = int(watchlist_summary.get("alerting_enabled_watchlists", 0)) if isinstance(watchlist_summary, dict) else 0
+
+    posture_score = 100.0
+    posture_findings: list[str] = []
+    if total_watchlists <= 0:
+        posture_score = 0.0
+        posture_findings.append("No watchlists configured")
+    else:
+        disabled_watchlists = max(total_watchlists - enabled_watchlists, 0)
+        disabled_ratio = (disabled_watchlists / total_watchlists) if total_watchlists > 0 else 0.0
+        if disabled_ratio > 0:
+            posture_score -= min(25.0, 25.0 * disabled_ratio)
+
+        if enabled_watchlists > 0:
+            enabled_without_alerting_ratio = enabled_without_alerting / enabled_watchlists
+            if enabled_without_alerting_ratio > 0:
+                posture_score -= min(45.0, 45.0 * enabled_without_alerting_ratio)
+                posture_findings.append("Many enabled watchlists are not configured to alert")
+
+            alerting_coverage_ratio = alerting_enabled_watchlists / enabled_watchlists
+            if alerting_coverage_ratio < 0.6:
+                posture_score -= min(30.0, 30.0 * ((0.6 - alerting_coverage_ratio) / 0.6))
+                posture_findings.append("Alerting coverage across enabled watchlists is low")
+        else:
+            posture_score -= 70.0
+            posture_findings.append("No enabled watchlists")
+    posture_score = max(min(posture_score, 100.0), 0.0)
+
+    signal_score = 100.0
+    signal_findings: list[str] = []
+    if total_alerts <= 0:
+        signal_score = 100.0
+    elif watchlist_alerts <= 0:
+        signal_score = 45.0 if total_alerts >= 200 else 70.0
+        signal_findings.append("No watchlist alerts observed in current alert set")
+    else:
+        if watchlist_alerts >= 100 and watchlist_low_ratio >= 0.75:
+            signal_score -= 35.0
+            signal_findings.append("Watchlist alert stream is dominated by sub-5 severity alerts")
+        elif watchlist_alerts >= 100 and watchlist_low_ratio >= 0.6:
+            signal_score -= 20.0
+            signal_findings.append("Watchlist alert stream has elevated sub-5 severity volume")
+
+        if watchlist_alerts >= 100 and watchlist_high_ratio < 0.1:
+            signal_score -= 20.0
+            signal_findings.append("Very low share of high-severity watchlist alerts")
+        elif watchlist_alerts >= 100 and watchlist_high_ratio < 0.2:
+            signal_score -= 10.0
+
+        if watchlist_alert_ratio > 0.9:
+            signal_score -= 15.0
+            signal_findings.append("Most alerts are watchlist-driven; likely over-triggering")
+        elif total_alerts >= 500 and watchlist_alert_ratio < 0.02:
+            signal_score -= 10.0
+            signal_findings.append("Very low watchlist contribution relative to total alert volume")
+
+        if top_watchlist_share > 0.6:
+            signal_score -= min(20.0, 20.0 * ((top_watchlist_share - 0.6) / 0.4))
+            signal_findings.append("Watchlist alert volume is highly concentrated in a single watchlist")
+    signal_score = max(min(signal_score, 100.0), 0.0)
+
+    effectiveness_score = int(round((posture_score * 0.4) + (signal_score * 0.6)))
+
+    return {
+        "score_0_100": effectiveness_score,
+        "posture_score_0_100": int(round(posture_score)),
+        "signal_score_0_100": int(round(signal_score)),
+        "metrics": {
+            "total_alerts": total_alerts,
+            "watchlist_alerts": watchlist_alerts,
+            "watchlist_alert_ratio": round(watchlist_alert_ratio, 4),
+            "watchlist_high_severity_alerts": watchlist_high_severity_alerts,
+            "watchlist_high_severity_ratio": round(watchlist_high_ratio, 4),
+            "watchlist_low_severity_alerts_lt5": watchlist_low_severity_alerts,
+            "watchlist_low_severity_ratio_lt5": round(watchlist_low_ratio, 4),
+            "top_watchlist_share": round(top_watchlist_share, 4),
+            "total_watchlists": total_watchlists,
+            "enabled_watchlists": enabled_watchlists,
+            "alerting_enabled_watchlists": alerting_enabled_watchlists,
+            "enabled_without_alerting_watchlists": enabled_without_alerting,
+        },
+        "findings": list(dict.fromkeys(posture_findings + signal_findings))[:6],
+        "top_watchlist_alert_counts": dict(watchlist_alert_counts.most_common(10)),
+    }
+
+
 def extract_watchlists_from_alerts(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     dedup: dict[str, dict[str, Any]] = {}
 
@@ -3000,6 +3149,8 @@ def health_score(
     alert_summary: dict[str, Any],
     policy_summary: dict[str, Any] | None = None,
     watchlist_summary: dict[str, Any] | None = None,
+    policy_tuning_summary: dict[str, Any] | None = None,
+    watchlist_effectiveness_summary: dict[str, Any] | None = None,
     assessment_profile: str = "prod",
 ) -> dict[str, Any]:
     score = 100
@@ -3025,6 +3176,29 @@ def health_score(
             notes.append("Elevated count of severity 7+ alerts")
     else:
         notes.append("Lab profile active: high-severity alert volume penalties reduced")
+
+    total_alerts = int(alert_summary.get("total_alerts_30d", 0))
+    severity_breakdown = alert_summary.get("severity_breakdown", {})
+    low_severity_alerts = 0
+    if isinstance(severity_breakdown, dict):
+        for sev_key, count in severity_breakdown.items():
+            try:
+                sev = int(str(sev_key).strip())
+                sev_count = int(float(count))
+            except Exception:
+                continue
+            if sev < 5 and sev_count > 0:
+                low_severity_alerts += sev_count
+
+    # Penalize noisy low-value alert composition only when alert volume is material.
+    low_severity_ratio = (low_severity_alerts / total_alerts) if total_alerts > 0 else 0.0
+    if total_alerts >= 200:
+        if low_severity_ratio >= 0.75:
+            score -= 6 if is_lab else 12
+            notes.append("Disproportionately high share of sub-5 severity alerts")
+        elif low_severity_ratio >= 0.6:
+            score -= 3 if is_lab else 6
+            notes.append("Elevated share of sub-5 severity alerts")
 
     if policy_summary is not None:
         enabled_policy_ratio = float(policy_summary.get("enabled_policy_ratio", 0.0))
@@ -3052,6 +3226,59 @@ def health_score(
             score -= 4 if is_lab else 10
             notes.append("Low proportion of enabled watchlists")
 
+    base_score = max(score, 0)
+
+    # Blend operational health with policy maturity and watchlist effectiveness.
+    # The base operational score remains dominant, while policy/watchlist quality
+    # materially affects the final health result when available.
+    policy_maturity_score: int | None = None
+    watchlist_effectiveness_score: int | None = None
+    policy_maturity_weight = 0.0
+    watchlist_effectiveness_weight = 0.0
+    base_weight = 1.0
+
+    if isinstance(policy_tuning_summary, dict):
+        framework_applicable = bool(policy_tuning_summary.get("framework_applicable", False))
+        maturity_raw = policy_tuning_summary.get("score_0_100")
+        try:
+            maturity_value = int(float(maturity_raw))
+        except Exception:
+            maturity_value = None
+
+        if framework_applicable and maturity_value is not None:
+            policy_maturity_score = max(min(maturity_value, 100), 0)
+            policy_maturity_weight = 0.25
+
+    if isinstance(watchlist_effectiveness_summary, dict):
+        effectiveness_raw = watchlist_effectiveness_summary.get("score_0_100")
+        try:
+            effectiveness_value = int(float(effectiveness_raw))
+        except Exception:
+            effectiveness_value = None
+        if effectiveness_value is not None:
+            watchlist_effectiveness_score = max(min(effectiveness_value, 100), 0)
+            watchlist_effectiveness_weight = 0.20
+
+    if policy_maturity_weight > 0.0 or watchlist_effectiveness_weight > 0.0:
+        base_weight = 1.0 - policy_maturity_weight - watchlist_effectiveness_weight
+        composite_score = base_score * base_weight
+        if policy_maturity_score is not None and policy_maturity_weight > 0.0:
+            composite_score += policy_maturity_score * policy_maturity_weight
+        if watchlist_effectiveness_score is not None and watchlist_effectiveness_weight > 0.0:
+            composite_score += watchlist_effectiveness_score * watchlist_effectiveness_weight
+        score = int(round(composite_score))
+
+        component_notes = [f"{int(round(base_weight * 100))}% operational health ({base_score}/100)"]
+        if policy_maturity_score is not None and policy_maturity_weight > 0.0:
+            component_notes.append(f"{int(round(policy_maturity_weight * 100))}% policy maturity ({policy_maturity_score}/100)")
+        if watchlist_effectiveness_score is not None and watchlist_effectiveness_weight > 0.0:
+            component_notes.append(
+                f"{int(round(watchlist_effectiveness_weight * 100))}% watchlist effectiveness ({watchlist_effectiveness_score}/100)"
+            )
+        notes.append("Composite scoring applied: " + " + ".join(component_notes))
+    else:
+        score = base_score
+
     if score >= 85:
         status = "good"
     elif score >= 65:
@@ -3060,10 +3287,16 @@ def health_score(
         status = "at_risk"
 
     return {
-        "score": max(score, 0),
+        "score": score,
         "status": status,
         "notes": notes,
         "assessment_profile": assessment_profile,
+        "base_score": base_score,
+        "policy_maturity_score": policy_maturity_score,
+        "watchlist_effectiveness_score": watchlist_effectiveness_score,
+        "base_weight": round(base_weight, 4),
+        "policy_maturity_weight": policy_maturity_weight,
+        "watchlist_effectiveness_weight": watchlist_effectiveness_weight,
     }
 
 

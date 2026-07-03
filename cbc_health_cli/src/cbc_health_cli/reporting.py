@@ -1322,6 +1322,7 @@ def _dormant_recommendation_appendix_data(
                     ]
                     for item in dormant_details
                 ]
+                rows.sort(key=lambda row: (str(row[2]).lower(), str(row[1]).lower()))
                 return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_details), "Recommendation Dormant Users"
 
             dormant_users = user_logins.get("dormant_over_60d", [])
@@ -1340,6 +1341,7 @@ def _dormant_recommendation_appendix_data(
                     ]
                     for item in dormant_details
                 ]
+                rows.sort(key=lambda row: (str(row[2]).lower(), str(row[1]).lower()))
                 return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_details), "Recommendation Dormant Users"
 
             dormant_users = user_logins.get("dormant_over_30d", [])
@@ -1701,7 +1703,7 @@ def _add_score_breakdown_slide(prs: Presentation, summary: dict[str, Any], asses
 
     score_notes = [
         "Overall score starts at 100 and applies weighted deductions.",
-        "Primary drivers: sensor activity, severity 7+ alerts, policy posture, and watchlist posture.",
+        "Primary drivers: sensor activity, alert severity mix (7+ and sub-5), policy posture, watchlist effectiveness, and policy maturity/tuning.",
     ]
     health_notes = health_data.get("notes", []) if isinstance(health_data, dict) else []
     if isinstance(health_notes, list):
@@ -1745,7 +1747,7 @@ def _add_metric_definitions_slide(
         1.15,
         "Alert Quality",
         _format_count(alert_quality.get("repeated_detection_keys_over_3")),
-        "repeated keys >3",
+        "repeated alert signatures >3",
         accent="DC2626",
     )
     _add_card(
@@ -1779,7 +1781,7 @@ def _add_metric_definitions_slide(
         ],
         [
             "Alert Quality",
-            "Actionability of alert stream using repeated keys and aging buckets.",
+            "Actionability of alert stream using repeated alert signatures and aging buckets.",
             "More duplicates and older unresolved alerts indicate triage friction.",
         ],
         [
@@ -1829,6 +1831,7 @@ def write_executive_pptx(run_dir: Path) -> Path:
     alerts = _get_check_summary(summary, "alerts")
     policy_posture = _get_check_summary(summary, "policy_posture")
     watchlists = _get_check_summary(summary, "watchlists")
+    watchlist_effectiveness = _get_check_summary(summary, "watchlist_effectiveness")
     drift = _get_check_summary(summary, "policy_drift")
     policy_settings = _get_check_summary(summary, "policy_settings")
     core_prevention = _get_check_summary(summary, "core_prevention_settings")
@@ -2090,93 +2093,96 @@ def write_executive_pptx(run_dir: Path) -> Path:
         color=_hex_color("23313F"),
     )
 
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _add_background(slide, "FFFFFF")
-    _add_section_header(
-        slide,
-        "Policy Analysis (Good/Better/Best)",
-        "High-level maturity view. Detailed policy actions are in the appendix.",
-    )
+    policy_tuning_check = summary.get("checks", {}).get("policy_tuning_analysis", {})
+    policy_tuning_status = str(policy_tuning_check.get("status", "")).strip().lower() if isinstance(policy_tuning_check, dict) else ""
+    if policy_tuning_status == "ok":
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        _add_background(slide, "FFFFFF")
+        _add_section_header(
+            slide,
+            "Policy Analysis (Good/Better/Best)",
+            "High-level maturity view. Detailed policy actions are in the appendix.",
+        )
 
-    current_tier = str(policy_tuning.get("current_tier", "unknown")).upper()
-    score = policy_tuning.get("score_0_100", "n/a")
-    review_cadence = str(policy_tuning.get("review_cadence", "quarterly_or_biannual")).replace("_", " ")
-    policy_metrics = policy_tuning.get("metrics", {}) if isinstance(policy_tuning, dict) else {}
+        current_tier = str(policy_tuning.get("current_tier", "unknown")).upper()
+        score = policy_tuning.get("score_0_100", "n/a")
+        review_cadence = str(policy_tuning.get("review_cadence", "quarterly_or_biannual")).replace("_", " ")
+        policy_metrics = policy_tuning.get("metrics", {}) if isinstance(policy_tuning, dict) else {}
 
-    _add_card(slide, 0.65, 1.25, 2.9, 1.15, "Maturity Tier", current_tier, "framework status", accent="0F766E")
-    _add_card(slide, 3.8, 1.25, 2.9, 1.15, "Policy Score", str(score), "0-100", accent="2563EB")
-    _add_card(
-        slide,
-        6.95,
-        1.25,
-        2.9,
-        1.15,
-        "Gaps",
-        _format_count(policy_metrics.get("policies_with_enforcement_gaps", 0)),
-        "policies",
-        accent="DC2626",
-    )
-    _add_card(slide, 10.1, 1.25, 2.55, 1.15, "Review Cadence", review_cadence, "recommended", accent="7C3AED", value_font_size_max=14)
+        _add_card(slide, 0.65, 1.25, 2.9, 1.15, "Maturity Tier", current_tier, "framework status", accent="0F766E")
+        _add_card(slide, 3.8, 1.25, 2.9, 1.15, "Policy Score", str(score), "0-100", accent="2563EB")
+        _add_card(
+            slide,
+            6.95,
+            1.25,
+            2.9,
+            1.15,
+            "Gaps",
+            _format_count(policy_metrics.get("policies_with_enforcement_gaps", 0)),
+            "policies",
+            accent="DC2626",
+        )
+        _add_card(slide, 10.1, 1.25, 2.55, 1.15, "Review Cadence", review_cadence, "recommended", accent="7C3AED", value_font_size_max=14)
 
-    gates = policy_tuning.get("gates", {}) if isinstance(policy_tuning, dict) else {}
-    gate_rows: list[list[Any]] = []
-    for gate_name in ["good", "better", "best"]:
-        gate = gates.get(gate_name, {}) if isinstance(gates, dict) else {}
-        passed = bool(gate.get("pass", False)) if isinstance(gate, dict) else False
-        criteria = str(gate.get("criteria", "n/a")) if isinstance(gate, dict) else "n/a"
-        gate_rows.append([gate_name.upper(), "MET" if passed else "NOT MET", criteria])
+        gates = policy_tuning.get("gates", {}) if isinstance(policy_tuning, dict) else {}
+        gate_rows: list[list[Any]] = []
+        for gate_name in ["good", "better", "best"]:
+            gate = gates.get(gate_name, {}) if isinstance(gates, dict) else {}
+            passed = bool(gate.get("pass", False)) if isinstance(gate, dict) else False
+            criteria = str(gate.get("criteria", "n/a")) if isinstance(gate, dict) else "n/a"
+            gate_rows.append([gate_name.upper(), "MET" if passed else "NOT MET", criteria])
 
-    _add_table(
-        slide,
-        0.65,
-        2.65,
-        12.0,
-        1.9,
-        ["Tier Gate", "Gate Status", "Criteria"],
-        gate_rows or [["n/a", "n/a", "Policy tuning analysis unavailable."]],
-    )
-
-    top_gaps = policy_tuning.get("top_gaps", []) if isinstance(policy_tuning, dict) else []
-    next_actions = policy_tuning.get("next_actions", []) if isinstance(policy_tuning, dict) else []
-    gap_rows = [["Gap", str(item)] for item in (top_gaps[:3] if isinstance(top_gaps, list) else [])]
-    gap_rows.extend([["Action", str(item)] for item in (next_actions[:3] if isinstance(next_actions, list) else [])])
-    _add_table(
-        slide,
-        0.65,
-        4.75,
-        12.0,
-        2.0,
-        ["Type", "Detail"],
-        gap_rows or [["Info", "No policy gaps/actions were generated."]],
-    )
-
-    policy_rec_rows_exec = _recommendation_rows(summary.get("recommendations", []), policy_only=True)
-    if policy_rec_rows_exec:
-        policy_analysis_footer = _add_textbox(
+        _add_table(
             slide,
             0.65,
-            7.05,
-            9.8,
-            0.18,
-            f"{len(policy_rec_rows_exec)} detailed policy recommendations are available in the appendix. Click to open.",
-            font_size=8,
-            color=_hex_color("2563EB"),
-            underline=True,
+            2.65,
+            12.0,
+            1.9,
+            ["Tier Gate", "Gate Status", "Criteria"],
+            gate_rows or [["n/a", "n/a", "Policy tuning analysis unavailable."]],
         )
-        pending_appendix_links.append((policy_analysis_footer, "Policy Recommendations (Page 1/"))
 
-    policy_plan_items_exec = _policy_maturity_action_plan_items(policy_tuning, attention_only=True)
-    if policy_plan_items_exec:
-        _add_textbox(
+        top_gaps = policy_tuning.get("top_gaps", []) if isinstance(policy_tuning, dict) else []
+        next_actions = policy_tuning.get("next_actions", []) if isinstance(policy_tuning, dict) else []
+        gap_rows = [["Gap", str(item)] for item in (top_gaps[:3] if isinstance(top_gaps, list) else [])]
+        gap_rows.extend([["Action", str(item)] for item in (next_actions[:3] if isinstance(next_actions, list) else [])])
+        _add_table(
             slide,
             0.65,
-            6.84,
-            11.2,
-            0.18,
-            f"{len(policy_plan_items_exec)} policies need maturity attention. Per-policy action-plan appendix is available only in the technical deck.",
-            font_size=8,
-            color=_hex_color("55606E"),
+            4.75,
+            12.0,
+            2.0,
+            ["Type", "Detail"],
+            gap_rows or [["Info", "No policy gaps/actions were generated."]],
         )
+
+        policy_rec_rows_exec = _recommendation_rows(summary.get("recommendations", []), policy_only=True)
+        if policy_rec_rows_exec:
+            policy_analysis_footer = _add_textbox(
+                slide,
+                0.65,
+                7.05,
+                9.8,
+                0.18,
+                f"{len(policy_rec_rows_exec)} detailed policy recommendations are available in the appendix. Click to open.",
+                font_size=8,
+                color=_hex_color("2563EB"),
+                underline=True,
+            )
+            pending_appendix_links.append((policy_analysis_footer, "Policy Recommendations (Page 1/"))
+
+        policy_plan_items_exec = _policy_maturity_action_plan_items(policy_tuning, attention_only=True)
+        if policy_plan_items_exec:
+            _add_textbox(
+                slide,
+                0.65,
+                6.84,
+                11.2,
+                0.18,
+                f"{len(policy_plan_items_exec)} policies need maturity attention. Per-policy action-plan appendix is available only in the technical deck.",
+                font_size=8,
+                color=_hex_color("55606E"),
+            )
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "F8FAFC")
@@ -2393,6 +2399,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
     alerts = _get_check_summary(summary, "alerts")
     policy_posture = _get_check_summary(summary, "policy_posture")
     watchlists = _get_check_summary(summary, "watchlists")
+    watchlist_effectiveness = _get_check_summary(summary, "watchlist_effectiveness")
     drift = _get_check_summary(summary, "policy_drift")
     policy_settings = _get_check_summary(summary, "policy_settings")
     core_prevention = _get_check_summary(summary, "core_prevention_settings")
@@ -2930,96 +2937,99 @@ def write_technical_pptx(run_dir: Path) -> Path:
         color=_hex_color("23313F"),
     )
 
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    _add_background(slide, "FFFFFF")
-    _add_section_header(
-        slide,
-        "Policy Analysis (Good/Better/Best)",
-        "High-level maturity checkpoint in the policy section. Full policy actions live in the appendix.",
-    )
+    policy_tuning_check = summary.get("checks", {}).get("policy_tuning_analysis", {})
+    policy_tuning_status = str(policy_tuning_check.get("status", "")).strip().lower() if isinstance(policy_tuning_check, dict) else ""
+    if policy_tuning_status == "ok":
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        _add_background(slide, "FFFFFF")
+        _add_section_header(
+            slide,
+            "Policy Analysis (Good/Better/Best)",
+            "High-level maturity checkpoint in the policy section. Full policy actions live in the appendix.",
+        )
 
-    current_tier = str(policy_tuning.get("current_tier", "unknown")).upper()
-    score = policy_tuning.get("score_0_100", "n/a")
-    review_cadence = str(policy_tuning.get("review_cadence", "quarterly_or_biannual")).replace("_", " ")
-    policy_metrics = policy_tuning.get("metrics", {}) if isinstance(policy_tuning, dict) else {}
+        current_tier = str(policy_tuning.get("current_tier", "unknown")).upper()
+        score = policy_tuning.get("score_0_100", "n/a")
+        review_cadence = str(policy_tuning.get("review_cadence", "quarterly_or_biannual")).replace("_", " ")
+        policy_metrics = policy_tuning.get("metrics", {}) if isinstance(policy_tuning, dict) else {}
 
-    _add_card(slide, 0.65, 1.2, 2.75, 1.2, "Maturity Tier", current_tier, "framework status", accent="0F766E")
-    _add_card(slide, 3.55, 1.2, 2.75, 1.2, "Policy Score", str(score), "0-100", accent="2563EB")
-    _add_card(
-        slide,
-        6.45,
-        1.2,
-        2.75,
-        1.2,
-        "Gaps",
-        _format_count(policy_metrics.get("policies_with_enforcement_gaps", 0)),
-        "policies",
-        accent="DC2626",
-    )
-    _add_card(slide, 9.35, 1.2, 3.3, 1.2, "Review Cadence", review_cadence, "recommended", accent="7C3AED", value_font_size_max=14)
+        _add_card(slide, 0.65, 1.2, 2.75, 1.2, "Maturity Tier", current_tier, "framework status", accent="0F766E")
+        _add_card(slide, 3.55, 1.2, 2.75, 1.2, "Policy Score", str(score), "0-100", accent="2563EB")
+        _add_card(
+            slide,
+            6.45,
+            1.2,
+            2.75,
+            1.2,
+            "Gaps",
+            _format_count(policy_metrics.get("policies_with_enforcement_gaps", 0)),
+            "policies",
+            accent="DC2626",
+        )
+        _add_card(slide, 9.35, 1.2, 3.3, 1.2, "Review Cadence", review_cadence, "recommended", accent="7C3AED", value_font_size_max=14)
 
-    gates = policy_tuning.get("gates", {}) if isinstance(policy_tuning, dict) else {}
-    gate_rows: list[list[Any]] = []
-    for gate_name in ["good", "better", "best"]:
-        gate = gates.get(gate_name, {}) if isinstance(gates, dict) else {}
-        passed = bool(gate.get("pass", False)) if isinstance(gate, dict) else False
-        criteria = str(gate.get("criteria", "n/a")) if isinstance(gate, dict) else "n/a"
-        gate_rows.append([gate_name.upper(), "MET" if passed else "NOT MET", criteria])
+        gates = policy_tuning.get("gates", {}) if isinstance(policy_tuning, dict) else {}
+        gate_rows: list[list[Any]] = []
+        for gate_name in ["good", "better", "best"]:
+            gate = gates.get(gate_name, {}) if isinstance(gates, dict) else {}
+            passed = bool(gate.get("pass", False)) if isinstance(gate, dict) else False
+            criteria = str(gate.get("criteria", "n/a")) if isinstance(gate, dict) else "n/a"
+            gate_rows.append([gate_name.upper(), "MET" if passed else "NOT MET", criteria])
 
-    _add_table(
-        slide,
-        0.65,
-        2.75,
-        12.0,
-        1.9,
-        ["Tier Gate", "Gate Status", "Criteria"],
-        gate_rows or [["n/a", "n/a", "Policy tuning analysis unavailable."]],
-    )
-
-    top_gaps = policy_tuning.get("top_gaps", []) if isinstance(policy_tuning, dict) else []
-    next_actions = policy_tuning.get("next_actions", []) if isinstance(policy_tuning, dict) else []
-    gap_rows = [["Gap", str(item)] for item in (top_gaps[:3] if isinstance(top_gaps, list) else [])]
-    gap_rows.extend([["Action", str(item)] for item in (next_actions[:3] if isinstance(next_actions, list) else [])])
-    _add_table(
-        slide,
-        0.65,
-        4.85,
-        12.0,
-        1.9,
-        ["Type", "Detail"],
-        gap_rows or [["Info", "No policy gaps/actions were generated."]],
-    )
-
-    policy_rec_rows_tech_summary = _recommendation_rows(summary.get("recommendations", []), policy_only=True)
-    if policy_rec_rows_tech_summary:
-        policy_analysis_footer_tech = _add_textbox(
+        _add_table(
             slide,
             0.65,
-            7.05,
-            9.8,
-            0.18,
-            f"{len(policy_rec_rows_tech_summary)} detailed policy recommendations are available in the appendix. Click to open.",
-            font_size=8,
-            color=_hex_color("2563EB"),
-            underline=True,
+            2.75,
+            12.0,
+            1.9,
+            ["Tier Gate", "Gate Status", "Criteria"],
+            gate_rows or [["n/a", "n/a", "Policy tuning analysis unavailable."]],
         )
-        pending_appendix_links.append((policy_analysis_footer_tech, "Policy Recommendations (Page 1/"))
 
-    policy_plan_items_tech = _policy_maturity_action_plan_items(policy_tuning, attention_only=True)
-    if policy_plan_items_tech:
-        policy_plan_footer_tech = _add_textbox(
+        top_gaps = policy_tuning.get("top_gaps", []) if isinstance(policy_tuning, dict) else []
+        next_actions = policy_tuning.get("next_actions", []) if isinstance(policy_tuning, dict) else []
+        gap_rows = [["Gap", str(item)] for item in (top_gaps[:3] if isinstance(top_gaps, list) else [])]
+        gap_rows.extend([["Action", str(item)] for item in (next_actions[:3] if isinstance(next_actions, list) else [])])
+        _add_table(
             slide,
             0.65,
-            6.84,
-            10.8,
-            0.18,
-            f"{len(policy_plan_items_tech)} policies need maturity attention. Click for per-policy next-level action plan.",
-            font_size=8,
-            color=_hex_color("2563EB"),
-            underline=True,
+            4.85,
+            12.0,
+            1.9,
+            ["Type", "Detail"],
+            gap_rows or [["Info", "No policy gaps/actions were generated."]],
         )
-        pending_appendix_links.append((policy_plan_footer_tech, "Policy Maturity Action Plan"))
-        _queue_policy_maturity_action_plan(policy_plan_items_tech, "Policy Maturity Action Plan")
+
+        policy_rec_rows_tech_summary = _recommendation_rows(summary.get("recommendations", []), policy_only=True)
+        if policy_rec_rows_tech_summary:
+            policy_analysis_footer_tech = _add_textbox(
+                slide,
+                0.65,
+                7.05,
+                9.8,
+                0.18,
+                f"{len(policy_rec_rows_tech_summary)} detailed policy recommendations are available in the appendix. Click to open.",
+                font_size=8,
+                color=_hex_color("2563EB"),
+                underline=True,
+            )
+            pending_appendix_links.append((policy_analysis_footer_tech, "Policy Recommendations (Page 1/"))
+
+        policy_plan_items_tech = _policy_maturity_action_plan_items(policy_tuning, attention_only=True)
+        if policy_plan_items_tech:
+            policy_plan_footer_tech = _add_textbox(
+                slide,
+                0.65,
+                6.84,
+                10.8,
+                0.18,
+                f"{len(policy_plan_items_tech)} policies need maturity attention. Click for per-policy next-level action plan.",
+                font_size=8,
+                color=_hex_color("2563EB"),
+                underline=True,
+            )
+            pending_appendix_links.append((policy_plan_footer_tech, "Policy Maturity Action Plan"))
+            _queue_policy_maturity_action_plan(policy_plan_items_tech, "Policy Maturity Action Plan")
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "FFFFFF")
@@ -3027,7 +3037,7 @@ def write_technical_pptx(run_dir: Path) -> Path:
     _add_card(slide, 0.65, 1.2, 2.75, 1.2, "Closed Alerts", _format_count(alert_workflow.get("closed_alerts")), f"Median close {_format_count(alert_workflow.get('median_time_to_close_hours'))}h", accent="22C55E")
     _add_card(slide, 3.55, 1.2, 2.75, 1.2, "Open >72h", _format_count(alert_workflow.get("open_alerts_over_72h")), "workflow backlog", accent="EF4444")
     _add_card(slide, 6.45, 1.2, 2.75, 1.2, "Stale Sensors", _format_count(sensor_quality.get("stale_sensors_over_7d")), "over 7 days", accent="F59E0B")
-    _add_card(slide, 9.35, 1.2, 3.3, 1.2, "Alert Noise", _format_ratio(alert_quality.get("noise_ratio")), f"Repeated keys { _format_count(alert_quality.get('repeated_detection_keys_over_3')) }", accent="7C3AED")
+    _add_card(slide, 9.35, 1.2, 3.3, 1.2, "Alert Noise", _format_ratio(alert_quality.get("noise_ratio")), f"Repeated alert signatures { _format_count(alert_quality.get('repeated_detection_keys_over_3')) }", accent="7C3AED")
     workflow_items = _sorted_mapping_items(alert_workflow.get("status_counts", {}), limit=6, sort_by_value=True)
     _add_column_chart(
         slide,

@@ -27,6 +27,7 @@ from cbc_health_cli.checks import (
     summarize_policy_posture,
     summarize_sensor_coverage_quality,
     summarize_user_logins_with_users,
+    summarize_watchlist_effectiveness,
     summarize_watchlists,
 )
 from cbc_health_cli.client import CBCClient
@@ -529,7 +530,9 @@ def run_command(args: argparse.Namespace) -> int:
     status.advance("Starting audit log collection")
 
     try:
-        audit_logs = client.get_audit_logs(backend_url, tenant_key, tenant_id=tenant_id)
+        # Use a larger audit-log window so connector/session metrics are less likely
+        # to be skewed by high-volume connectors dominating the most recent 2k rows.
+        audit_logs = client.get_audit_logs(backend_url, tenant_key, rows=10000, tenant_id=tenant_id)
     except Exception as exc:
         summary["warnings"].append(f"audit log API unavailable: {exc}")
     status.advance("Starting live query API collection")
@@ -652,6 +655,28 @@ def run_command(args: argparse.Namespace) -> int:
     except Exception as exc:
         summary["checks"]["alert_quality"] = {"status": "error"}
         summary["errors"].append(f"alert quality check failed: {exc}")
+
+    watchlists_check = summary["checks"].get("watchlists", {})
+    if watchlists_check.get("status") == "ok":
+        try:
+            watchlist_effectiveness = summarize_watchlist_effectiveness(
+                watchlists_check.get("summary", {}),
+                alerts,
+            )
+            summary["checks"]["watchlist_effectiveness"] = {"status": "ok", "summary": watchlist_effectiveness}
+        except Exception as exc:
+            summary["checks"]["watchlist_effectiveness"] = {"status": "error"}
+            summary["errors"].append(f"watchlist effectiveness check failed: {exc}")
+    elif watchlists_check.get("status") == "not_applicable":
+        summary["checks"]["watchlist_effectiveness"] = {
+            "status": "not_applicable",
+            "reason": watchlists_check.get("reason", "Watchlists are not enabled for this org"),
+        }
+    else:
+        summary["checks"]["watchlist_effectiveness"] = {
+            "status": "unavailable",
+            "reason": "Watchlist summary unavailable",
+        }
     status.advance("Starting policy efficacy check")
 
     try:
@@ -686,15 +711,23 @@ def run_command(args: argparse.Namespace) -> int:
         asum = summary["checks"]["alerts"]["summary"]
         psum = None
         wsum = None
+        ptsum = None
+        wlesum = None
         if summary["checks"].get("policy_posture", {}).get("status") == "ok":
             psum = summary["checks"]["policy_posture"]["summary"]
         if summary["checks"].get("watchlists", {}).get("status") == "ok":
             wsum = summary["checks"]["watchlists"]["summary"]
+        if summary["checks"].get("policy_tuning_analysis", {}).get("status") == "ok":
+            ptsum = summary["checks"]["policy_tuning_analysis"]["summary"]
+        if summary["checks"].get("watchlist_effectiveness", {}).get("status") == "ok":
+            wlesum = summary["checks"]["watchlist_effectiveness"]["summary"]
         summary["health"] = health_score(
             dsum,
             asum,
             psum,
             wsum,
+            ptsum,
+            wlesum,
             assessment_profile=config.assessment_profile,
         )
     status.advance("Starting recommendation generation")
