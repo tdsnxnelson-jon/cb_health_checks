@@ -530,9 +530,9 @@ def run_command(args: argparse.Namespace) -> int:
     status.advance("Starting audit log collection")
 
     try:
-        # Use a larger audit-log window so connector/session metrics are less likely
-        # to be skewed by high-volume connectors dominating the most recent 2k rows.
-        audit_logs = client.get_audit_logs(backend_url, tenant_key, rows=10000, tenant_id=tenant_id)
+        # Fetch audit logs from the full 30-day window with pagination to capture all events.
+        # API may cap results at ~10k per page, so we paginate through to accumulate more events.
+        audit_logs = client.get_audit_logs(backend_url, tenant_key, rows=None, tenant_id=tenant_id, lookback_days=30)
     except Exception as exc:
         summary["warnings"].append(f"audit log API unavailable: {exc}")
     status.advance("Starting live query API collection")
@@ -565,6 +565,7 @@ def run_command(args: argparse.Namespace) -> int:
     status.advance("Starting API connector usage check")
 
     try:
+        connector_activity: dict[str, dict[str, Any]] = {}
         try:
             connector_ids = sorted(
                 {
@@ -576,10 +577,20 @@ def run_command(args: argparse.Namespace) -> int:
                 }
             )
             api_access_keys = client.get_api_access_keys(backend_url, tenant_key, tenant_id, connector_ids)
+            if connector_ids:
+                try:
+                    connector_activity = client.get_connector_session_activity(
+                        backend_url,
+                        tenant_key,
+                        connector_ids,
+                        lookback_days=30,
+                    )
+                except Exception as exc:
+                    summary["warnings"].append(f"connector targeted audit query unavailable: {exc}")
         except Exception as exc:
             summary["warnings"].append(f"api access keys API unavailable: {exc}")
 
-        connector_use = summarize_api_connector_use(audit_logs, api_access_keys)
+        connector_use = summarize_api_connector_use(audit_logs, api_access_keys, connector_activity)
         summary["checks"]["api_connector_use"] = {"status": "ok", "summary": connector_use}
     except Exception as exc:
         summary["checks"]["api_connector_use"] = {"status": "error"}

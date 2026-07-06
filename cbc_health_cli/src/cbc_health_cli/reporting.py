@@ -3114,8 +3114,8 @@ def write_technical_pptx(run_dir: Path) -> Path:
     _add_background(slide, "FFFFFF")
     _add_section_header(slide, "API Hygiene", "Connector activity, source IP ownership, and origin country for API access sessions.")
 
-    connector_rows = _rows_from_list(api_connector_use.get("active_connectors", []), ["connector_id", "api_access_level_type", "session_count"], 8)
-    connector_counts = {str(row[0]): _to_numeric(row[2]) for row in connector_rows if len(row) == 3}
+    connector_rows = _rows_from_list(api_connector_use.get("active_connectors", []), ["connector_id", "api_access_level_type", "session_count", "ip_addresses"], 8)
+    connector_counts = {str(row[0]): _to_numeric(row[2]) for row in connector_rows if len(row) >= 3}
     connector_items = _sorted_mapping_items(connector_counts, limit=5, sort_by_value=True)
 
     top_source_ips = api_connector_use.get("top_source_ips", []) if isinstance(api_connector_use, dict) else []
@@ -3185,8 +3185,8 @@ def write_technical_pptx(run_dir: Path) -> Path:
         5.25,
         7.2,
         1.65,
-        ["Connector", "API Access Level Type", "Sessions"],
-        connector_rows or [["n/a", "n/a", 0]],
+        ["Connector", "API Access Level Type", "Sessions", "IP Addresses"],
+        connector_rows or [["n/a", "n/a", 0, "n/a"]],
     )
 
     live_query_check = summary.get("checks", {}).get("live_query_audit_remediation", {})

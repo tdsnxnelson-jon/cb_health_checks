@@ -291,15 +291,27 @@ def _extract_rule_operation_ids(rule: dict[str, Any]) -> set[str]:
     return operation_ids
 
 
-def _normalize_status(device: dict[str, Any]) -> str:
+def _raw_device_status(device: dict[str, Any]) -> str:
     raw = _pick_value(device, ["status", "sensor_state", "state", "device_status"], "unknown")
     status = str(raw).strip().upper()
 
     if _to_bool(device.get("quarantined")) is True or "QUAR" in status:
         return "QUARANTINE"
+    if "BYPASS_ON" in status:
+        return "BYPASS_ON"
     if _to_bool(device.get("bypass")) is True or "BYPASS" in status:
         return "BYPASS"
+    if status == "SENSOR_OUTOFDATE" or ("SENSOR" in status and "OUTOFDATE" in status):
+        return "SENSOR_OUTOFDATE"
+    return status
+
+
+def _normalize_status(device: dict[str, Any]) -> str:
+    status = _raw_device_status(device)
+
     if status == "REGISTERED":
+        return "ACTIVE"
+    if status == "LIVE":
         return "ACTIVE"
     if "INACTIVE" in status:
         return "INACTIVE"
@@ -307,17 +319,34 @@ def _normalize_status(device: dict[str, Any]) -> str:
         return "DEREGISTERED"
     if "ACTIVE" in status:
         return "ACTIVE"
+    if status == "ALL":
+        return "ALL"
     if status in {"UNKNOWN", ""}:
         return "UNKNOWN"
     return status
 
 
-def _exclude_deregistered_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [device for device in devices if _normalize_status(device) != "DEREGISTERED"]
+COUNTED_DEVICE_STATUSES = {
+    "REGISTERED",
+    "ACTIVE",
+    "INACTIVE",
+    "ALL",
+    "BYPASS_ON",
+    "BYPASS",
+    "QUARANTINE",
+    "SENSOR_OUTOFDATE",
+    "LIVE",
+}
+
+ACTIVE_ENDPOINT_STATUSES = {"ACTIVE", "LIVE", "BYPASS", "BYPASS_ON"}
+
+
+def _filter_counted_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [device for device in devices if _raw_device_status(device) in COUNTED_DEVICE_STATUSES]
 
 
 def summarize_devices(devices: list[dict[str, Any]]) -> dict[str, Any]:
-    counted_devices = _exclude_deregistered_devices(devices)
+    counted_devices = _filter_counted_devices(devices)
     total = len(counted_devices)
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     active_7d = 0
@@ -1491,8 +1520,10 @@ def _enrich_ips(ips: list[str]) -> dict[str, dict[str, str | None]]:
 def summarize_api_connector_use(
     audit_logs: list[dict[str, Any]],
     api_access_keys: list[dict[str, Any]] | None = None,
+    connector_activity: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     api_access_keys = api_access_keys or []
+    connector_activity = connector_activity or {}
 
     api_access_type_by_id: dict[str, str] = {}
     for key in api_access_keys:
@@ -1522,6 +1553,7 @@ def summarize_api_connector_use(
     access_type_counter: Counter[str] = Counter()
     connector_access_type_counter: dict[str, Counter[str]] = defaultdict(Counter)
     ip_counter: Counter[str] = Counter()
+    connector_ips: dict[str, set[str]] = defaultdict(set)
     connector_events: list[dict[str, Any]] = []
 
     for event in audit_logs:
@@ -1542,6 +1574,7 @@ def summarize_api_connector_use(
         ip = str(_pick_value(event, ["actor_ip", "ip_address", "source_ip", "client_ip"], "unknown")).strip()
         if ip:
             ip_counter[ip] += 1
+            connector_ips[connector_id].add(ip)
 
         connector_events.append({
             "connector_id": connector_id,
@@ -1551,11 +1584,55 @@ def summarize_api_connector_use(
             "create_time": event.get("create_time", ""),
         })
 
+    connector_session_events = len(connector_events)
+
+    # When targeted connector activity is provided, trust those connector-specific
+    # counts over bulk audit parsing (which can be capped/truncated).
+    if connector_activity:
+        connector_sessions = Counter()
+        access_type_counter = Counter()
+        connector_access_type_counter = defaultdict(Counter)
+        ip_counter = Counter()
+        connector_ips = defaultdict(set)
+        connector_session_events = 0
+
+        for connector_id, metrics in connector_activity.items():
+            if not isinstance(metrics, dict):
+                continue
+            session_count = int(metrics.get("session_count", 0) or 0)
+            if session_count <= 0:
+                continue
+
+            connector_sessions[connector_id] = session_count
+            connector_session_events += session_count
+
+            access_level_type = api_access_type_by_id.get(connector_id, "") or "unknown"
+            access_type_counter[access_level_type] += session_count
+            connector_access_type_counter[connector_id][access_level_type] += session_count
+
+            ips_raw = metrics.get("ip_addresses", [])
+            if isinstance(ips_raw, list):
+                for value in ips_raw:
+                    ip = str(value).strip()
+                    if ip:
+                        connector_ips[connector_id].add(ip)
+
+            ip_counts_raw = metrics.get("ip_counts", {})
+            if isinstance(ip_counts_raw, dict) and ip_counts_raw:
+                for raw_ip, raw_count in ip_counts_raw.items():
+                    ip = str(raw_ip).strip()
+                    if not ip:
+                        continue
+                    ip_counter[ip] += int(raw_count or 0)
+            else:
+                for ip in connector_ips.get(connector_id, set()):
+                    ip_counter[ip] += 1
+
     dormant_entities: list[str] = []
 
     return {
         "total_audit_events": len(audit_logs),
-        "connector_session_events": len(connector_events),
+        "connector_session_events": connector_session_events,
         "active_connectors": [
             {
                 "connector_id": cid,
@@ -1565,6 +1642,7 @@ def summarize_api_connector_use(
                     else "unknown"
                 ),
                 "session_count": count,
+                "ip_addresses": ", ".join(sorted(connector_ips.get(cid, set()))),
             }
             for cid, count in connector_sessions.most_common()
             if cid != "unknown"
@@ -2145,7 +2223,7 @@ def summarize_banned_hashes(reputation_overrides: list[dict[str, Any]]) -> dict[
 
 
 def summarize_endpoint_status(devices: list[dict[str, Any]]) -> dict[str, Any]:
-    counted_devices = _exclude_deregistered_devices(devices)
+    counted_devices = _filter_counted_devices(devices)
     status_counts: Counter[str] = Counter()
 
     for device in counted_devices:
@@ -2269,6 +2347,9 @@ def summarize_user_logins_with_users(
     login_count_by_user: Counter[str] = Counter()
     ips_by_user: dict[str, set[str]] = defaultdict(set)
 
+    def _normalize_user_identifier(value: Any) -> str:
+        return str(value or "").strip().lower()
+
     email_login_pattern = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\s+logged in successfully", re.IGNORECASE)
 
     for event in audit_logs:
@@ -2279,10 +2360,10 @@ def summarize_user_logins_with_users(
         if not is_login:
             continue
 
-        user = str(_pick_value(event, ["username", "user", "actor", "principal"], "unknown"))
+        user = _normalize_user_identifier(_pick_value(event, ["username", "user", "actor", "principal"], "unknown"))
         match = email_login_pattern.search(description)
         if match:
-            user = match.group(1)
+            user = _normalize_user_identifier(match.group(1))
 
         event_time = _to_dt(_pick_value(event, ["timestamp", "create_time", "event_time", "time"]))
         ip = str(_pick_value(event, ["actor_ip", "ip_address", "source_ip", "client_ip"], "unknown")).strip()
@@ -2303,16 +2384,12 @@ def summarize_user_logins_with_users(
     user_role_by_identifier: dict[str, str] = {}
 
     def _set_role(identifier: str, role: str) -> None:
-        key = str(identifier or "").strip()
+        key = _normalize_user_identifier(identifier)
         if not key:
             return
         existing = user_role_by_identifier.get(key)
         if existing in (None, "", "unknown") and role:
             user_role_by_identifier[key] = role
-        lower_key = key.lower()
-        existing_lower = user_role_by_identifier.get(lower_key)
-        if existing_lower in (None, "", "unknown") and role:
-            user_role_by_identifier[lower_key] = role
 
     # Prefer grants for role assignment because role placement differs by tenant
     # (grant.roles vs grant.profiles[].roles).
@@ -2326,41 +2403,44 @@ def summarize_user_logins_with_users(
         # Keep first role; CBC grants are commonly single-role per principal.
         role_name = normalized_roles[0] if normalized_roles else "unknown"
 
-        principal_name = str(_pick_value(grant, ["principal_name", "principalName", "email", "username"], "")).strip()
+        principal_name = _normalize_user_identifier(
+            _pick_value(grant, ["principal_name", "principalName", "email", "username"], "")
+        )
         if principal_name:
             _set_role(principal_name, role_name)
 
         principal = str(grant.get("principal", "")).strip()
         if principal.startswith("psc:user:"):
-            principal_id = principal.split(":")[-1]
+            principal_id = _normalize_user_identifier(principal.split(":")[-1])
             if principal_id:
                 _set_role(principal_id, role_name)
 
     for user in users:
         role = str(_pick_value(user, ["role", "user_role", "access_role"], "unknown")).strip() or "unknown"
         normalized_user_role = _normalize_role_name(role)
-        canonical_user = str(
+        canonical_user = _normalize_user_identifier(
             _pick_value(user, ["login_name", "email", "username", "user_name", "login", "name"], "")
-        ).strip()
+        )
         if canonical_user:
             known_users.add(canonical_user)
 
         for key in ["login_name", "email", "username", "user_name", "login", "name", "login_id", "contact_id"]:
-            identifier = str(_pick_value(user, [key], "")).strip()
+            identifier = _normalize_user_identifier(_pick_value(user, [key], ""))
             if not identifier:
                 continue
             _set_role(identifier, normalized_user_role)
 
-        login_id = str(_pick_value(user, ["login_id"], "")).strip()
+        login_id = _normalize_user_identifier(_pick_value(user, ["login_id"], ""))
         if canonical_user and login_id:
             # Login events sometimes resolve to numeric login IDs.
             _set_role(canonical_user, user_role_by_identifier.get(login_id, normalized_user_role))
 
     def _user_role(user_name: str) -> str:
-        direct = user_role_by_identifier.get(user_name)
+        normalized_user = _normalize_user_identifier(user_name)
+        direct = user_role_by_identifier.get(normalized_user)
         if direct not in (None, ""):
             return str(direct)
-        return str(user_role_by_identifier.get(str(user_name).lower(), "unknown"))
+        return "unknown"
 
     users_to_evaluate = known_users if known_users else set(last_login_by_user.keys())
 
@@ -2424,7 +2504,7 @@ def summarize_user_logins_with_users(
 
 
 def summarize_sensor_coverage_quality(devices: list[dict[str, Any]]) -> dict[str, Any]:
-    counted_devices = _exclude_deregistered_devices(devices)
+    counted_devices = _filter_counted_devices(devices)
     now = datetime.now(timezone.utc)
     stale_sensors = 0
     version_counts: Counter[str] = Counter()
@@ -3348,7 +3428,7 @@ def prioritized_recommendations(summary: dict[str, Any]) -> list[dict[str, str]]
     status_counts = endpoint_status.get("status_counts", {})
     active_endpoints = 0
     if isinstance(status_counts, dict):
-        active_endpoints = int(status_counts.get("ACTIVE", 0)) + int(status_counts.get("BYPASS", 0))
+        active_endpoints = sum(int(status_counts.get(status, 0)) for status in ACTIVE_ENDPOINT_STATUSES)
     if active_endpoints <= 0:
         active_endpoints = total_devices
 

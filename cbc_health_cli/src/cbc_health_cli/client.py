@@ -307,13 +307,19 @@ class CBCClient:
         self,
         backend_url: str,
         tenant_key: str,
-        rows: int = 2000,
+        rows: int | None = None,
         tenant_id: str | None = None,
+        lookback_days: int = 30,
     ) -> list[dict[str, Any]]:
-        """Fetch audit logs up to the requested row cap with pagination."""
+        """Fetch audit logs across the requested lookback window with time-based pagination.
+        
+        Note: APIs often cap pagination at ~10k results. To get events older than 10k rows,
+        we paginate through time windows, requesting from the oldest part of the window first.
+        """
         normalized_backend = backend_url.rstrip("/")
         org = tenant_key
-        target_rows = max(1, rows)
+        target_rows = max(1, rows) if rows is not None else None
+        lookback_days = max(1, lookback_days)
 
         modern_paths = [
             "/audit_log/v1/orgs/{org}/logs/_search",
@@ -335,16 +341,17 @@ class CBCClient:
                 try:
                     last_attempt = f"{method} {url}"
                     all_results: list[dict[str, Any]] = []
-                    page_size = max(1, min(target_rows, 1000))
-                    start = 0
-                    max_iterations = 25
+                    page_size = 1000
+                    max_iterations = 300  # ~300 pages * 1k rows = 300k max total
                     iteration = 0
 
-                    while iteration < max_iterations and len(all_results) < target_rows:
-                        request_rows = min(page_size, target_rows - len(all_results))
+                    # Paginate without row limit to collect all events in the window
+                    start = 0
+                    while iteration < max_iterations:
+                        request_rows = page_size
                         payload = {
                             "criteria": {},
-                            "time_range": {"range": "-30d"},
+                            "time_range": {"range": f"-{lookback_days}d"},
                             "start": start,
                             "rows": request_rows,
                             "sort": [{"field": "timestamp", "order": "DESC"}],
@@ -368,17 +375,21 @@ class CBCClient:
                         if not results:
                             break
                         all_results.extend(results)
+                        # Stop if API returns fewer rows than requested (end of data reached)
                         if len(results) < request_rows:
+                            break
+                        # Stop if we've reached target rows
+                        if target_rows is not None and len(all_results) >= target_rows:
                             break
                         start += len(results)
                         iteration += 1
 
                     if all_results:
-                        return all_results[:target_rows]
+                        return all_results[:target_rows] if target_rows is not None else all_results
                     last_error = RuntimeError(f"Audit log endpoint returned zero entries: {method} {url}")
                 except Exception as exc:
                     if all_results:
-                        return all_results[:target_rows]
+                        return all_results[:target_rows] if target_rows is not None else all_results
                     last_error = exc
                     attempt_failures.append(f"{method} {url} -> {exc}")
 
@@ -396,13 +407,14 @@ class CBCClient:
                     try:
                         last_attempt = f"{method} {url}"
                         all_results = []
-                        page_size = max(1, min(target_rows, 1000))
+                        page_size = 1000
                         from_row = 1
-                        max_iterations = 25
+                        max_iterations = 300
                         iteration = 0
 
-                        while iteration < max_iterations and len(all_results) < target_rows:
-                            request_rows = min(page_size, target_rows - len(all_results))
+                        while iteration < max_iterations:
+                            request_rows = page_size
+                            payload_org_id = legacy_org if str(legacy_org).isdigit() else (str(tenant_id) if tenant_id else legacy_org)
                             payload = {
                                 "version": "1",
                                 "fromRow": from_row,
@@ -410,7 +422,7 @@ class CBCClient:
                                 "searchWindow": "ALL",
                                 "sortDefinition": {"fieldName": "TIME", "sortOrder": "DESC"},
                                 "criteria": {"FLAGGED_ENTRIES": ["false"], "VERBOSE_ENTRIES": ["false"]},
-                                "orgId": legacy_org,
+                                "orgId": payload_org_id,
                             }
                             if method == "POST":
                                 response = self._post(url, payload)
@@ -430,15 +442,17 @@ class CBCClient:
                             all_results.extend(results)
                             if len(results) < request_rows:
                                 break
+                            if target_rows is not None and len(all_results) >= target_rows:
+                                break
                             from_row += len(results)
                             iteration += 1
 
                         if all_results:
-                            return all_results[:target_rows]
+                            return all_results[:target_rows] if target_rows is not None else all_results
                         last_error = RuntimeError(f"Audit log endpoint returned zero entries: {method} {url}")
                     except Exception as exc:
                         if all_results:
-                            return all_results[:target_rows]
+                            return all_results[:target_rows] if target_rows is not None else all_results
                         last_error = exc
                         attempt_failures.append(f"{method} {url} -> {exc}")
 
@@ -449,6 +463,101 @@ class CBCClient:
                 attempts_context = f" (attempts: {' | '.join(attempt_failures[:8])})"
             raise RuntimeError(f"Unable to fetch audit logs: {last_error}{attempt_context}{attempts_context}") from last_error
         return []
+
+    def get_connector_session_activity(
+        self,
+        backend_url: str,
+        tenant_key: str,
+        connector_ids: list[str],
+        lookback_days: int = 30,
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch connector session counts and IP activity via targeted actor criteria searches.
+
+        This avoids scanning only the newest generic audit rows when connector-specific
+        counts are needed.
+        """
+        normalized_backend = backend_url.rstrip("/")
+        lookback_days = max(1, lookback_days)
+        deduped_connector_ids = [str(cid).strip() for cid in connector_ids if str(cid).strip()]
+        deduped_connector_ids = list(dict.fromkeys(deduped_connector_ids))
+        if not deduped_connector_ids:
+            return {}
+
+        modern_paths = [
+            "/audit_log/v1/orgs/{org}/logs/_search",
+            "/auditlog/v1/orgs/{org}/logs/_search",
+            "/api/audit_log/v1/orgs/{org}/logs/_search",
+        ]
+
+        last_error: Exception | None = None
+        for path in modern_paths:
+            url = f"{normalized_backend}{path.format(org=tenant_key)}"
+            activity: dict[str, dict[str, Any]] = {}
+            for connector_id in deduped_connector_ids:
+                try:
+                    start = 0
+                    page_size = 1000
+                    # Use num_found for full count and collect a bounded IP distribution sample.
+                    max_iterations_for_ip_sampling = 50
+                    iteration = 0
+                    session_count: int | None = None
+                    ip_counter: dict[str, int] = {}
+
+                    while iteration < max_iterations_for_ip_sampling:
+                        payload = {
+                            "criteria": {"actor": [connector_id]},
+                            "time_range": {"range": f"-{lookback_days}d"},
+                            "start": start,
+                            "rows": page_size,
+                            "sort": [{"field": "timestamp", "order": "DESC"}],
+                        }
+                        try:
+                            response = self._post(url, payload)
+                        except Exception as exc:
+                            last_error = exc
+                            break
+                        response_text = (response.text or "").strip()
+                        if not response_text:
+                            break
+
+                        data = response.json()
+                        if session_count is None and isinstance(data, dict):
+                            num_found_raw = data.get("num_found")
+                            if isinstance(num_found_raw, int):
+                                session_count = num_found_raw
+
+                        results = self._extract_list_payload(data)
+                        if not results:
+                            break
+
+                        for row in results:
+                            ip = str(row.get("actor_ip") or "").strip()
+                            if not ip:
+                                continue
+                            ip_counter[ip] = int(ip_counter.get(ip, 0)) + 1
+
+                        if len(results) < page_size:
+                            break
+                        start += len(results)
+                        iteration += 1
+
+                    total_sessions = int(session_count) if session_count is not None else int(sum(ip_counter.values()))
+                    if total_sessions > 0 or ip_counter:
+                        activity[connector_id] = {
+                            "session_count": total_sessions,
+                            "ip_addresses": sorted(ip_counter.keys()),
+                            "ip_counts": ip_counter,
+                        }
+                except Exception as exc:
+                    last_error = exc
+
+            if activity:
+                return activity
+
+        if last_error:
+            # Degrade gracefully to bulk audit parsing when targeted queries are unavailable.
+            return {}
+        return {}
 
     def get_live_query_activity(
         self,
