@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -30,7 +31,7 @@ from cbc_health_cli.checks import (
     summarize_watchlist_effectiveness,
     summarize_watchlists,
 )
-from cbc_health_cli.client import CBCClient
+from cbc_health_cli.client import CBCClient, CredentialsRejectedError
 from cbc_health_cli.config import load_app_config
 from cbc_health_cli.reporting import (
     create_run_dir,
@@ -285,6 +286,13 @@ def run_command(args: argparse.Namespace) -> int:
         tenant_id = tenant_id or discovered.tenant_id
         tenant_key = tenant_key or discovered.tenant_key
         backend_url = backend_url or discovered.backend_url
+
+    try:
+        client.verify_credentials(backend_url, tenant_key)
+    except CredentialsRejectedError as exc:
+        print(f"ERROR: {exc}")
+        print("No output written. Check the API ID/secret and that the key still exists in Settings > API Access.")
+        return 3
     status.advance("Starting previous baseline load")
 
     previous_run_dir = find_latest_run_dir(config.output_dir, tenant_key)
@@ -770,6 +778,12 @@ def run_command(args: argparse.Namespace) -> int:
 
     print(f"Run complete. Output directory: {run_dir}")
     print(f"Execution time: {elapsed_human} ({elapsed_seconds:.3f} seconds)")
+    access_warnings = [w for w in summary["warnings"] if re.search(r"\b40[13] Client Error", str(w))]
+    if access_warnings:
+        print("Access warnings (401/403, full text in summary.json):")
+        for warning in access_warnings:
+            text = str(warning)
+            print(f"- {text[:300]}{'...' if len(text) > 300 else ''}")
     if summary["errors"]:
         print("Completed with errors:")
         for err in summary["errors"]:

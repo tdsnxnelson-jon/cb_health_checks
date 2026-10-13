@@ -3678,7 +3678,8 @@ def prioritized_recommendations(summary: dict[str, Any]) -> list[dict[str, str]]
                     "recommendation": (
                         "Review core prevention and blocking/isolation posture: one or more policies have "
                         "alert-only (REPORT) behavior and/or are missing required blocking controls. "
-                        "Use Test Rule first, then enforce validated high-risk behavior with DENY/TERMINATE and close missing-control gaps where the environment allows."
+                        "For Blocking and Isolation policies, use Test Rule before enforcing validated high-risk behavior with DENY/TERMINATE. "
+                        "For Core Prevention, review the available protection modes and close missing-control gaps where the environment allows; Test Rule is not available."
                     ),
                     "evidence": (
                         f"policies_with_gaps={combined_gap_count}, "

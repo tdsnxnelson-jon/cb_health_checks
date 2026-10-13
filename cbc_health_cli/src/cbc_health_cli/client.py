@@ -18,6 +18,41 @@ class TenantInfo:
     tenant_key: str
 
 
+class CredentialsRejectedError(RuntimeError):
+    pass
+
+
+def _is_auth_failure(exc: requests.HTTPError) -> bool:
+    return exc.response is not None and exc.response.status_code in (401, 403)
+
+
+def _error_detail(response: requests.Response) -> str:
+    try:
+        body = response.json()
+    except ValueError:
+        content_type = response.headers.get("Content-Type", "unknown")
+        return f"non-JSON body, content_type={content_type}"
+    if not isinstance(body, dict):
+        return ""
+    code = body.get("error_code") or body.get("title") or ""
+    if isinstance(code, list):
+        code = ",".join(str(item) for item in code)
+    message = body.get("message") or body.get("detail") or body.get("reason") or ""
+    return ": ".join(str(part) for part in (code, message) if part)[:200]
+
+
+def _raise_for_status(response: requests.Response) -> None:
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        if not 400 <= response.status_code < 500:
+            raise
+        detail = _error_detail(response)
+        if not detail:
+            raise
+        raise requests.HTTPError(f"{exc} [{detail}]", response=response) from None
+
+
 class CBCClient:
     def __init__(self, api_id: str, api_key: str, verify_tls: bool = True, timeout_seconds: int = 30):
         self.api_id = api_id
@@ -35,12 +70,12 @@ class CBCClient:
 
     def _get(self, url: str) -> requests.Response:
         response = self._request("GET", url)
-        response.raise_for_status()
+        _raise_for_status(response)
         return response
 
     def _post(self, url: str, payload: dict[str, Any]) -> requests.Response:
         response = self._request("POST", url, json=payload)
-        response.raise_for_status()
+        _raise_for_status(response)
         return response
 
     def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
@@ -87,10 +122,10 @@ class CBCClient:
         for backend in backends:
             try:
                 backend = backend.rstrip("/") if backend else backend
-                orgs_url = f"{backend}/appservices/v5/orgs/"
+                orgs_url = f"{backend}/appservices/v5/orgs"
                 orgs_data = self._get(orgs_url).json()
                 org = orgs_data["organizations"][0]["id"]
-                org_url = f"{backend}/appservices/v5/orgs/{org}/"
+                org_url = f"{backend}/appservices/v5/orgs/{org}"
                 org_data = self._get(org_url).json()
                 org_key = org_data["organization"]["orgKey"]
                 return TenantInfo(backend_url=backend, tenant_id=org, tenant_key=org_key)
@@ -101,8 +136,19 @@ class CBCClient:
             raise RuntimeError(f"Unable to discover tenant/backend: {last_error}") from last_error
         raise RuntimeError("Unable to discover tenant/backend")
 
+    def verify_credentials(self, backend_url: str, tenant_key: str) -> None:
+        url = f"{backend_url.rstrip('/')}/appservices/v6/orgs/{tenant_key}/devices/_search"
+        response = self._request("POST", url, json={"criteria": {}, "rows": 1, "start": 0})
+        if response.status_code not in (401, 403):
+            return
+        detail = _error_detail(response) or response.reason
+        raise CredentialsRejectedError(
+            f"API credentials rejected by {backend_url} for org {tenant_key} "
+            f"(HTTP {response.status_code} {detail})"
+        )
+
     def get_org_details(self, backend_url: str, tenant_id: str) -> dict[str, Any]:
-        url = f"{backend_url.rstrip('/')}/appservices/v5/orgs/{tenant_id}/"
+        url = f"{backend_url.rstrip('/')}/appservices/v5/orgs/{tenant_id}"
         return self._get(url).json()
 
     def get_devices(self, backend_url: str, tenant_key: str, rows: int = 5000) -> list[dict[str, Any]]:
@@ -131,6 +177,10 @@ class CBCClient:
                     break
                 start += page_size
                 iteration += 1
+            except requests.HTTPError as exc:
+                if _is_auth_failure(exc):
+                    raise
+                break
             except Exception:
                 break
 
@@ -169,6 +219,10 @@ class CBCClient:
                     break
                 start += page_size
                 iteration += 1
+            except requests.HTTPError as exc:
+                if _is_auth_failure(exc):
+                    raise
+                break
             except Exception:
                 break
 
@@ -360,7 +414,7 @@ class CBCClient:
                             response = self._post(url, payload)
                         else:
                             response = self._request("GET", url, params=payload)
-                            response.raise_for_status()
+                            _raise_for_status(response)
                         response_text = (response.text or "").strip()
                         if not response_text:
                             break
@@ -596,7 +650,7 @@ class CBCClient:
                 request_rows = min(page_size, target_rows - len(all_results))
                 params = {"start": start, "rows": request_rows}
                 response = self._request("GET", url, params=params)
-                response.raise_for_status()
+                _raise_for_status(response)
                 data = _parse_json(response)
                 results = self._extract_list_payload(data)
                 if not results:
@@ -623,7 +677,7 @@ class CBCClient:
                     "rows": request_rows,
                 }
                 response = self._request("POST", url, json=payload)
-                response.raise_for_status()
+                _raise_for_status(response)
                 data = _parse_json(response)
                 results = self._extract_list_payload(data)
                 if not results:

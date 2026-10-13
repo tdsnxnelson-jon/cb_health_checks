@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,13 @@ def find_latest_run_dir(output_root: Path, tenant_key: str) -> Path | None:
 def read_records_csv(csv_path: Path) -> list[dict[str, Any]]:
     if not csv_path.exists():
         return []
+    field_size_limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(field_size_limit)
+            break
+        except OverflowError:
+            field_size_limit //= 10
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         return [dict(row) for row in reader]
@@ -691,19 +699,24 @@ def _fit_column_widths(table: Any, headers: list[str], rows: list[list[Any]], ta
 
     if deficit > 0:
         flex_indices = [idx for idx, width_in in enumerate(widths) if width_in > min_col_width_in]
-        while deficit > 0 and flex_indices:
+        while deficit > 1e-9 and flex_indices:
             flex_total = sum(widths[idx] - min_col_width_in for idx in flex_indices)
             if flex_total <= 0:
                 break
+            pass_deficit = deficit
+            redistributed = 0.0
             for idx in list(flex_indices):
                 flex = widths[idx] - min_col_width_in
-                share = deficit * (flex / flex_total)
+                share = pass_deficit * (flex / flex_total)
                 reduction = min(share, flex)
                 widths[idx] -= reduction
-                deficit -= reduction
+                redistributed += reduction
                 if widths[idx] <= min_col_width_in + 1e-6:
                     widths[idx] = min_col_width_in
-            flex_indices = [idx for idx, width_in in enumerate(widths) if width_in > min_col_width_in]
+            deficit = max(0.0, pass_deficit - redistributed)
+            flex_indices = [idx for idx, width_in in enumerate(widths) if width_in > min_col_width_in + 1e-6]
+            if redistributed <= 1e-12:
+                break
 
     for col_idx, width_in in enumerate(widths):
         table.columns[col_idx].width = Inches(width_in)
@@ -1313,7 +1326,7 @@ def _dormant_recommendation_appendix_data(
         evidence = str(rec.get("evidence", ""))
         if "dormant_over_60d_count=" in evidence:
             dormant_details = user_logins.get("dormant_over_60d_details", [])
-            if isinstance(dormant_details, list) and len(dormant_details) > displayed_names_in_evidence:
+            if isinstance(dormant_details, list) and len(dormant_details) > 0:
                 rows = [
                     [
                         "60d+",
@@ -1326,13 +1339,13 @@ def _dormant_recommendation_appendix_data(
                 return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_details), "Recommendation Dormant Users"
 
             dormant_users = user_logins.get("dormant_over_60d", [])
-            if isinstance(dormant_users, list) and len(dormant_users) > displayed_names_in_evidence:
+            if isinstance(dormant_users, list) and len(dormant_users) > 0:
                 rows = [["60d+", user, "unknown"] for user in dormant_users]
                 return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_users), "Recommendation Dormant Users"
             return None
         if "dormant_over_30d_count=" in evidence:
             dormant_details = user_logins.get("dormant_over_30d_details", [])
-            if isinstance(dormant_details, list) and len(dormant_details) > displayed_names_in_evidence:
+            if isinstance(dormant_details, list) and len(dormant_details) > 0:
                 rows = [
                     [
                         "30d+",
@@ -1345,7 +1358,7 @@ def _dormant_recommendation_appendix_data(
                 return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_details), "Recommendation Dormant Users"
 
             dormant_users = user_logins.get("dormant_over_30d", [])
-            if isinstance(dormant_users, list) and len(dormant_users) > displayed_names_in_evidence:
+            if isinstance(dormant_users, list) and len(dormant_users) > 0:
                 rows = [["30d+", user, "unknown"] for user in dormant_users]
                 return rows, ["Dormancy Bucket", "User", "Role"], displayed_names_in_evidence, len(dormant_users), "Recommendation Dormant Users"
             return None
@@ -3069,10 +3082,19 @@ def write_technical_pptx(run_dir: Path) -> Path:
         series_name="Alerts",
     )
 
+    if isinstance(user_logins, dict):
+        dormant_7d = _to_numeric(user_logins.get("dormant_over_7d_count", 0))
+        dormant_30d = _to_numeric(user_logins.get("dormant_over_30d_count", 0))
+        dormant_60d = _to_numeric(user_logins.get("dormant_over_60d_count", 0))
+        never_logged_in = _to_numeric(user_logins.get("users_without_login_events_count", 0))
+    else:
+        dormant_7d = dormant_30d = dormant_60d = never_logged_in = 0.0
+
     dormant_counts = {
-        "7d+": _to_numeric(user_logins.get("dormant_over_7d_count", 0)) if isinstance(user_logins, dict) else 0.0,
-        "30d+": _to_numeric(user_logins.get("dormant_over_30d_count", 0)) if isinstance(user_logins, dict) else 0.0,
-        "60d+": _to_numeric(user_logins.get("dormant_over_60d_count", 0)) if isinstance(user_logins, dict) else 0.0,
+        "7-29d": max(0.0, dormant_7d - dormant_30d),
+        "30-59d": max(0.0, dormant_30d - dormant_60d),
+        "60d+": max(0.0, dormant_60d - never_logged_in),
+        "Never logged in": never_logged_in,
     }
     dormant_items = list(dormant_counts.items())
     _add_column_chart(

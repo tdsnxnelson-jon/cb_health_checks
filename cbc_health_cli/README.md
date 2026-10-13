@@ -30,6 +30,15 @@ A Docker-free, Windows-native command line tool to run Carbon Black Cloud health
 - Writes a PowerPoint executive summary from `summary.json` for stakeholder sharing.
 - Writes a second technical PowerPoint deck from `summary.json` for engineering review.
 
+## BYPASS Rule Priorities
+
+The Detailed Breakdown slide classifies enabled or disabled policy rules whose normalized action is `BYPASS`, based on wildcard path values found in the rule's path-related fields and conditions:
+
+- **P1 (Critical):** A candidate path starts and ends with `**`, indicating a broadly scoped path pattern.
+- **P2 (High):** A candidate path starts with `**` or ends with `**`, but not both.
+
+The slide reports the number of distinct policies containing at least one matching rule at each priority, not the number of matching rules. A policy can count as both P1 and P2 if it contains rules matching both patterns. These labels are this tool's prioritization heuristic, not Carbon Black Cloud rule severity labels.
+
 ## Requirements
 
 - Windows 11 laptop with Python 3.10+ installed
@@ -54,7 +63,17 @@ Copy and edit [config.example.yaml](config.example.yaml), or create a JSON confi
 
 Several checks depend on the CBC Access v2 grants API (`GET /access/v2/orgs/{org}/grants/{principal}`) to resolve user roles and API connector access level types. This endpoint is only accessible to Super Admin credentials. The "View All" built-in role and all custom access levels return 403 for connector principal lookups (`psc:cnn:*`), even though they can read user principal grants. The relevant permission is not exposed as a configurable capability in the Access Levels UI, so there is no way to grant it to a restricted key.
 
-If a non-Super Admin key is used, the tool will still run and produce output, but user roles and API connector access level types will show as `unknown` in the summary, slides, and recommendations.
+If a non-Super Admin key is used, the tool will still run and produce output, but with these gaps (verified with a View All-style key):
+
+- **Org details** (`GET /appservices/v5/orgs/{org_id}`) returns 403 and is recorded as an `org check failed` error. As a result:
+  - The cover slide and deck filenames fall back to the backend hostname instead of the org domain.
+  - EEDR-only detection (`ORG_DISABLE_DEFENSE_RULES`) cannot run, so policy and core prevention slides render charts instead of "not applicable" on EEDR-only tenants.
+- **Users API** (`GET /appservices/v6/orgs/{org_key}/users`) returns 403. User and login data still comes from audit logs, but user roles show as `unknown`.
+- **Connector grants** return 403, so API connector access level types show as `unknown`.
+m
+A 403 is not always caused by the access level. Other causes include the key type (SIEM and Live Response keys), MSSP parent/child org keys, authorized-IP restrictions on the key, and a corporate proxy or WAF. HTTP errors include the server's `error_code` and message in brackets (for example `[TOKEN_INVALID: Session Token is in blacklist]`). Errors are printed at the end of the run; 401/403 warnings are printed under `Access warnings`; full text for both is in `summary.json`. A `non-JSON body` detail means something other than the Carbon Black API answered, such as a proxy, WAF, or gateway error page. Confirm by repeating the call from a network without the proxy.
+
+If the key is rejected outright (401/403 on the initial device search), the run stops with exit code 3 and writes no output.
 
 ## Run
 
