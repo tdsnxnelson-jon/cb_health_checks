@@ -510,19 +510,78 @@ def _extract_alert_reputation(alert: dict[str, Any]) -> str:
     return ""
 
 
-def summarize_alerts(alerts: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_alerts(
+    alerts: list[dict[str, Any]],
+    core_prevention_rule_names: dict[tuple[str, str], str] | None = None,
+) -> dict[str, Any]:
     total = len(alerts)
     severity_counter: Counter[str] = Counter()
     type_counter: Counter[str] = Counter()
     attack_technique_counter: Counter[str] = Counter()
     process_counter: Counter[str] = Counter()
     reputation_counter: Counter[str] = Counter()
+    alerted_policy_counter: Counter[str] = Counter()
+    cb_analytics_reason_counter: Counter[str] = Counter()
+    intrusion_detection_counter: Counter[str] = Counter()
+    core_prevention_counter: Counter[str] = Counter()
+    watchlist_report_counter: Counter[str] = Counter()
+    core_prevention_names = (
+        "Advanced Scripting Prevention",
+        "Carbon Black Threat Intel",
+        "Credential Theft",
+        "Defense Evasion",
+        "Persistence",
+        "Privilege Escalation",
+    )
 
     for a in alerts:
         sev = str(_pick_value(a, ["severity", "threat_score", "impact_score"], "unknown"))
         atype = str(_pick_value(a, ["type", "category", "alert_type"], "unknown"))
         severity_counter[sev] += 1
         type_counter[atype] += 1
+
+        policy_name = str(_pick_value(a, ["device_policy", "policy_name", "policy_applied"], "")).strip()
+        if policy_name and policy_name.upper() != "NOT_APPLIED":
+            alerted_policy_counter[policy_name] += 1
+
+        reason = str(_pick_value(a, ["reason", "report_description"], "")).strip()
+        if atype.upper() == "CB_ANALYTICS" and reason:
+            identified_as = re.search(r"identified as\s+([A-Z0-9_ -]+?)(?:[.,!]|$)", reason, re.IGNORECASE)
+            if identified_as:
+                reason_type = f"Identified as {identified_as.group(1).strip().upper()}"
+            else:
+                normalized_reason = re.sub(r"(?i)\b[a-z]:\\[^\s,;]+", "<path>", reason)
+                normalized_reason = re.sub(r"(?i)\b[\w.-]+\.exe\b", "<process>", normalized_reason)
+                normalized_reason = re.sub(r"\s+", " ", normalized_reason).strip().rstrip(".")
+                reason_type = normalized_reason
+            cb_analytics_reason_counter[reason_type] += 1
+
+        rule_category_id = str(_pick_value(a, ["rule_category_id"], "")).strip()
+        rule_id = str(_pick_value(a, ["rule_id"], "")).strip()
+        if not rule_id or not rule_category_id:
+            reason_code = str(_pick_value(a, ["reason_code"], "")).strip()
+            if ":" in reason_code:
+                reason_category_id, reason_rule_id = reason_code.split(":", 1)
+                rule_category_id = rule_category_id or reason_category_id.strip()
+                rule_id = rule_id or reason_rule_id.strip()
+        core_rule_name = (core_prevention_rule_names or {}).get((rule_category_id, rule_id), "")
+        if core_rule_name in core_prevention_names:
+            core_prevention_counter[core_rule_name] += 1
+
+        if atype.upper() == "INTRUSION_DETECTION_SYSTEM" and reason:
+            normalized_reason = re.sub(r"(?i)\b[a-z]:\\[^\s,;]+", "<path>", reason)
+            normalized_reason = re.sub(r"(?i)\b[\w.-]+\.exe\b", "<process>", normalized_reason)
+            normalized_reason = re.sub(r"\s+", " ", normalized_reason).strip().rstrip(".")
+            intrusion_detection_counter[normalized_reason] += 1
+
+        if atype.upper() == "WATCHLIST":
+            report_name = str(_pick_value(a, ["report_name"], "")).strip()
+            if not report_name and reason:
+                report_match = re.search(r'\breport\s+"([^"\r\n]+)"', reason, re.IGNORECASE)
+                if report_match:
+                    report_name = report_match.group(1).strip()
+            if report_name:
+                watchlist_report_counter[report_name] += 1
 
         for technique in _extract_alert_attack_techniques(a):
             attack_technique_counter[technique] += 1
@@ -544,6 +603,11 @@ def summarize_alerts(alerts: list[dict[str, Any]]) -> dict[str, Any]:
         "attack_technique_breakdown": dict(attack_technique_counter.most_common(10)),
         "process_breakdown": dict(process_counter.most_common(10)),
         "reputation_breakdown": dict(reputation_counter.most_common(10)),
+        "top_alerted_policies": dict(alerted_policy_counter.most_common(10)),
+        "top_cb_analytics_alert_types": dict(cb_analytics_reason_counter.most_common(10)),
+        "top_intrusion_detection_alerts": dict(intrusion_detection_counter.most_common(10)),
+        "top_core_prevention_alert_rules": dict(core_prevention_counter.most_common(10)),
+        "top_watchlist_reports": dict(watchlist_report_counter.most_common(10)),
     }
 
 

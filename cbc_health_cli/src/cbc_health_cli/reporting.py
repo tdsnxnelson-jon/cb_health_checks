@@ -722,7 +722,15 @@ def _fit_column_widths(table: Any, headers: list[str], rows: list[list[Any]], ta
         table.columns[col_idx].width = Inches(width_in)
 
 
-def _add_table(slide, left: float, top: float, width: float, height: float, headers: list[str], rows: list[list[Any]]) -> None:
+def _add_table(
+    slide,
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+    headers: list[str],
+    rows: list[list[Any]],
+) -> Any:
     table_shape = slide.shapes.add_table(len(rows) + 1, len(headers), Inches(left), Inches(top), Inches(width), Inches(height))
     table = table_shape.table
     _fit_column_widths(table, headers, rows, width)
@@ -774,6 +782,96 @@ def _add_table(slide, left: float, top: float, width: float, height: float, head
             if row_index % 2 == 0:
                 cell.fill.solid()
                 cell.fill.fore_color.rgb = _hex_color("F4F7FB")
+    return table_shape
+
+
+def _add_ranking_table(
+    slide,
+    left: float,
+    top: float,
+    width: float,
+    max_height: float,
+    items: list[tuple[str, float]],
+    *,
+    font_size: float = 8,
+) -> Any:
+    rows = [[f"{rank}. {name}", _format_count(value)] for rank, (name, value) in enumerate(items, start=1)]
+    if not rows:
+        rows = [["No matching alerts", "0"]]
+
+    table_shape = slide.shapes.add_table(
+        len(rows) + 1,
+        2,
+        Inches(left),
+        Inches(top),
+        Inches(width),
+        Inches(max_height),
+    )
+    table = table_shape.table
+    count_width = min(0.82, width * 0.2)
+    table.columns[1].width = Inches(count_width)
+    table.columns[0].width = Inches(width - count_width)
+
+    header_height = 0.28
+    table.rows[0].height = Inches(header_height)
+    for col_index, header in enumerate(("Alert / Report", "Count")):
+        cell = table.cell(0, col_index)
+        cell.text = header
+        cell.margin_left = Pt(4)
+        cell.margin_right = Pt(4)
+        cell.margin_top = Pt(1)
+        cell.margin_bottom = Pt(1)
+        cell.vertical_anchor = MSO_VERTICAL_ANCHOR.MIDDLE
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = _hex_color("102033")
+        for paragraph in cell.text_frame.paragraphs:
+            paragraph.alignment = PP_ALIGN.CENTER
+            paragraph.space_before = Pt(0)
+            paragraph.space_after = Pt(0)
+            for run in paragraph.runs:
+                run.font.bold = True
+                run.font.size = Pt(9)
+                run.font.name = "Aptos"
+                run.font.color.rgb = _hex_color("FFFFFF")
+
+    label_width_points = max((width - count_width) * 72 - 12, 40)
+    chars_per_line = max(int(label_width_points / (font_size * 0.52)), 18)
+    row_heights: list[float] = []
+    for row_values in rows:
+        label = row_values[0]
+        line_count = max(1, (len(label) + chars_per_line - 1) // chars_per_line)
+        row_heights.append(max(0.22, (font_size * 1.25 / 72 * line_count) + 0.04))
+
+    available_body_height = max(max_height - header_height, 0.2)
+    total_body_height = sum(row_heights)
+    if total_body_height > available_body_height:
+        scale = available_body_height / total_body_height
+        row_heights = [height * scale for height in row_heights]
+
+    for row_index, (row_values, row_height) in enumerate(zip(rows, row_heights), start=1):
+        table.rows[row_index].height = Inches(row_height)
+        for col_index, value in enumerate(row_values):
+            cell = table.cell(row_index, col_index)
+            cell.text = _safe_str(value)
+            cell.margin_left = Pt(4)
+            cell.margin_right = Pt(4)
+            cell.margin_top = Pt(1)
+            cell.margin_bottom = Pt(1)
+            cell.vertical_anchor = MSO_VERTICAL_ANCHOR.MIDDLE
+            for paragraph in cell.text_frame.paragraphs:
+                paragraph.alignment = PP_ALIGN.LEFT if col_index == 0 else PP_ALIGN.CENTER
+                paragraph.space_before = Pt(0)
+                paragraph.space_after = Pt(0)
+                for run in paragraph.runs:
+                    run.font.size = Pt(font_size)
+                    run.font.name = "Aptos"
+                    run.font.color.rgb = _hex_color("23313F")
+            if row_index % 2 == 0:
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = _hex_color("F4F7FB")
+
+    table_shape.height = Inches(header_height + sum(row_heights))
+    return table_shape
 
 
 def _to_numeric(value: Any) -> float:
@@ -1991,9 +2089,11 @@ def write_executive_pptx(run_dir: Path) -> Path:
 
     daily_counts = daily_alerts.get("daily_alert_counts", {}) if isinstance(daily_alerts, dict) else {}
     trend_labels, trend_values = _daily_alert_trend_data(daily_counts, max_points=35)
-    trend_title = "Daily Alerts Trend"
-    if alerts_api_total > alerts_processed and alerts_processed > 0:
-        trend_title = f"Daily Alerts Trend (sampled {_format_count(alerts_processed)} of {_format_count(alerts_api_total)})"
+    api_avg_daily_alerts = alerts_api_total / 180
+    trend_title = (
+        f"Daily Alerts (sampled {_format_count(alerts_processed)} of "
+        f"{_format_count(alerts_api_total)}; daily average is {api_avg_daily_alerts:,.2f})"
+    )
     _add_line_chart(slide, 0.65, 4.35, 7.65, 2.05, trend_title, trend_labels, trend_values, series_name="Alerts/day")
 
     live_query_check = summary.get("checks", {}).get("live_query_audit_remediation", {})
@@ -2742,13 +2842,15 @@ def write_technical_pptx(run_dir: Path) -> Path:
         _tech_alerts_detail = f"API total {_format_count(_tech_alerts_api_total)}"
     _add_card(slide, 3.55, 1.2, 2.75, 1.2, "Alerts", _format_count(_tech_alerts_processed), _tech_alerts_detail, accent="DC2626")
     
-    _add_card(slide, 6.45, 1.2, 2.75, 1.2, "Avg Daily Alerts", _format_count(daily_alerts.get("avg_daily_alerts")), f"Spike days {_format_count(len(daily_alerts.get('spike_days', [])))}", accent="7C3AED")
+    _tech_api_avg_daily_alerts = _tech_alerts_api_total / 180
+    _add_card(slide, 6.45, 1.2, 2.75, 1.2, "Avg Daily Alerts", _format_count(_tech_api_avg_daily_alerts), "API total / 180 days", accent="7C3AED")
     _add_card(slide, 9.35, 1.2, 3.3, 1.2, "Endpoint Status", _format_count(endpoint_status.get("non_active_total")), "non-active devices", accent="0F766E")
 
     trend_labels, trend_values = _daily_alert_trend_data(daily_alerts.get("daily_alert_counts", {}), max_points=45)
-    _tech_trend_title = "Daily Alerts Over Time"
-    if _tech_alerts_api_total > _tech_alerts_processed and _tech_alerts_processed > 0:
-        _tech_trend_title = f"Daily Alerts (sampled {_format_count(_tech_alerts_processed)} of {_format_count(_tech_alerts_api_total)})"
+    _tech_trend_title = (
+        f"Daily Alerts (sampled {_format_count(_tech_alerts_processed)} of "
+        f"{_format_count(_tech_alerts_api_total)}; daily average {_tech_api_avg_daily_alerts:,.2f})"
+    )
     _add_line_chart(slide, 0.65, 2.65, 7.25, 3.8, _tech_trend_title, trend_labels, trend_values, series_name="Alerts/day")
 
     severity_items = _sorted_mapping_items(alerts.get("severity_breakdown", {}), limit=6, sort_by_value=True)
@@ -2779,6 +2881,71 @@ def write_technical_pptx(run_dir: Path) -> Path:
     )
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _add_background(slide, "FFFFFF")
+    _add_section_header(slide, "Alert Analysis", "Top alerted policies and normalized CB Analytics reasons.")
+    alert_analysis_panels = [
+        ("Top 10 Alerted Policies", "top_alerted_policies", 0.65, 5.95),
+        ("Top 10 CB Analytics Alert Types", "top_cb_analytics_alert_types", 6.75, 5.95),
+    ]
+    for panel_title, summary_key, left, width in alert_analysis_panels:
+        _add_textbox(
+            slide,
+            left,
+            1.35,
+            width,
+            0.3,
+            panel_title,
+            font_size=12,
+            bold=True,
+            color=_hex_color("102033"),
+        )
+        _add_ranking_table(
+            slide,
+            left,
+            1.72,
+            width,
+            5.3,
+            _sorted_mapping_items(alerts.get(summary_key, {}), limit=10, sort_by_value=True),
+        )
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _add_background(slide, "FFFFFF")
+    _add_section_header(slide, "Alert Analysis - Continued", "Intrusion detection, core prevention, and the watchlist reports generating alerts.")
+    alert_analysis_continued_panels = [
+        ("Top 10 Intrusion Detection Alerts", "top_intrusion_detection_alerts", 0.65, 5.95),
+        ("Top Core Prevention Rules Generating Alerts", "top_core_prevention_alert_rules", 6.75, 5.95),
+        ("Top 10 Alerted Watchlist Reports", "top_watchlist_reports", 0.65, 12.05),
+    ]
+    for index, (panel_title, summary_key, left, width) in enumerate(alert_analysis_continued_panels):
+        if index < 2:
+            title_top = 1.35
+            table_top = 1.72
+            table_height = 2.3
+        else:
+            title_top = 4.28
+            table_top = 4.65
+            table_height = 2.35
+        _add_textbox(
+            slide,
+            left,
+            title_top,
+            width,
+            0.3,
+            panel_title,
+            font_size=12,
+            bold=True,
+            color=_hex_color("102033"),
+        )
+        _add_ranking_table(
+            slide,
+            left,
+            table_top,
+            width,
+            table_height,
+            _sorted_mapping_items(alerts.get(summary_key, {}), limit=10, sort_by_value=True),
+        )
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "F8FAFC")
     _add_section_header(slide, "Endpoint Platform and Sensor Health", "Device OS mix and sensor-version spread live together so this reads as fleet posture, not alert context.")
 
@@ -2787,33 +2954,59 @@ def write_technical_pptx(run_dir: Path) -> Path:
     _add_card(slide, 6.45, 1.2, 2.75, 1.2, "Stale Sensors", _format_count(sensor_quality.get("stale_sensors_over_7d")), "over 7 days", accent="F59E0B")
     _add_card(slide, 9.35, 1.2, 3.3, 1.2, "Non-active Endpoints", _format_count(endpoint_status.get("non_active_total")), "status exceptions", accent="DC2626")
 
+    sensor_versions_by_os = sensor_quality.get("sensor_version_breakdown_by_os", {})
     os_items = _sorted_mapping_items(devices.get("os_breakdown", {}), limit=6, sort_by_value=True)
-    _add_doughnut_chart(
-        slide,
-        0.65,
-        2.85,
-        5.95,
-        3.35,
-        "Device OS Mix",
-        [name for name, _ in os_items],
-        [value for _, value in os_items],
-        series_name="Devices",
-    )
+    os_version_groups: dict[str, dict[str, int]] = {"Windows": {}, "macOS": {}, "Linux": {}}
+    for os_name, versions in sensor_versions_by_os.items():
+        os_token = str(os_name).strip().casefold()
+        if "win" in os_token:
+            group_name = "Windows"
+        elif "mac" in os_token or "darwin" in os_token:
+            group_name = "macOS"
+        elif "linux" in os_token:
+            group_name = "Linux"
+        else:
+            group_name = "Other"
+        group = os_version_groups.setdefault(group_name, {})
+        for version, count in versions.items():
+            group[version] = group.get(version, 0) + int(count)
 
-    sensor_items = _sorted_mapping_items(sensor_quality.get("sensor_version_breakdown", {}), limit=10, sort_by_value=True)
-    _add_bar_chart(
-        slide,
-        6.75,
-        2.85,
-        5.95,
-        3.35,
-        "Top Sensor Versions",
-        [_truncate_chart_label(name, max_length=26) for name, _ in sensor_items],
-        [value for _, value in sensor_items],
-        series_name="Devices",
-        show_data_labels=False,
-        category_font_size=8,
+    chart_groups: list[tuple[str, list[tuple[str, int]]]] = [("Device OS Mix", os_items)]
+    chart_groups.extend(
+        (f"Top Sensor Versions - {os_name}", _sorted_mapping_items(versions, limit=10, sort_by_value=True))
+        for os_name, versions in os_version_groups.items()
+        if versions
     )
+    chart_width = 12.05 / max(len(chart_groups), 1)
+    for index, (chart_title, items) in enumerate(chart_groups):
+        chart_left = 0.65 + (index * chart_width)
+        chart_width_adjusted = chart_width - 0.15
+        if chart_title == "Device OS Mix":
+            _add_doughnut_chart(
+                slide,
+                chart_left,
+                2.85,
+                chart_width_adjusted,
+                3.35,
+                chart_title,
+                [name for name, _ in items],
+                [value for _, value in items],
+                series_name="Devices",
+            )
+            continue
+        _add_bar_chart(
+            slide,
+            chart_left,
+            2.85,
+            chart_width_adjusted,
+            3.35,
+            chart_title,
+            [_truncate_chart_label(name, max_length=20) for name, _ in items],
+            [value for _, value in items],
+            series_name="Devices",
+            show_data_labels=False,
+            category_font_size=8,
+        )
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "FFFFFF")

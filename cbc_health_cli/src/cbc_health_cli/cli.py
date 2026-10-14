@@ -449,6 +449,61 @@ def run_command(args: argparse.Namespace) -> int:
     except Exception as exc:
         summary["checks"]["policy_posture"] = {"status": "error"}
         summary["errors"].append(f"policy posture check failed: {exc}")
+
+    alert_rule_config_names: dict[tuple[str, str], str] = {}
+    alert_rule_lookup_keys: set[tuple[str, str, str]] = set()
+    policy_id_by_name = {
+        str(policy.get("name", "")).strip().casefold(): str(
+            policy.get("id", policy.get("policy_id", ""))
+        ).strip()
+        for policy in policies
+        if str(policy.get("name", "")).strip()
+        and str(policy.get("id", policy.get("policy_id", ""))).strip()
+    }
+    for alert in alerts:
+        alert_type = str(alert.get("type") or "").strip().upper()
+        if alert_type != "CB_ANALYTICS":
+            continue
+        policy_name = str(alert.get("device_policy") or "").strip().casefold()
+        policy_id = policy_id_by_name.get(policy_name, "") or str(alert.get("policy_id") or "").strip()
+        rule_id = str(alert.get("rule_id") or "").strip()
+        rule_category_id = str(alert.get("rule_category_id") or "").strip()
+        if not rule_id or not rule_category_id:
+            reason_code = str(alert.get("reason_code") or "").strip()
+            if ":" in reason_code:
+                reason_category_id, reason_rule_id = reason_code.split(":", 1)
+                rule_category_id = rule_category_id or reason_category_id.strip()
+                rule_id = rule_id or reason_rule_id.strip()
+        if policy_id and rule_id and rule_category_id:
+            alert_rule_lookup_keys.add((policy_id, rule_id, rule_category_id))
+
+    failed_rule_lookups = 0
+    for policy_id, rule_id, rule_category_id in sorted(alert_rule_lookup_keys):
+        try:
+            rule_config = client.get_alert_rule_config(
+                backend_url,
+                tenant_key,
+                policy_id,
+                rule_id,
+                rule_category_id,
+            )
+        except Exception:
+            failed_rule_lookups += 1
+            continue
+        config_name = str(rule_config.get("rule_config_name") or rule_config.get("name", "")).strip()
+        if config_name:
+            alert_rule_config_names[(rule_category_id, rule_id)] = config_name
+
+    alerts_check = summary["checks"].get("alerts", {})
+    if alerts_check.get("status") == "ok":
+        alerts_summary = summarize_alerts(alerts, core_prevention_rule_names=alert_rule_config_names)
+        alerts_summary["total_alerts_in_api"] = alerts_num_found
+        alerts_summary["total_alerts_processed"] = len(alerts)
+        alerts_check["summary"] = alerts_summary
+        if failed_rule_lookups:
+            summary["warnings"].append(
+                f"Policy Service rule-config lookup failed for {failed_rule_lookups} unique alert rules"
+            )
     status.advance("Starting data collection settings load")
 
     try:

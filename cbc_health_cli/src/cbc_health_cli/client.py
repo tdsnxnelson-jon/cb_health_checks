@@ -328,6 +328,27 @@ class CBCClient:
                 f"Unable to fetch core prevention rules for {policy_id}: {exc}"
             ) from exc
 
+    def get_alert_rule_config(
+        self,
+        backend_url: str,
+        tenant_key: str,
+        policy_id: str,
+        rule_id: str,
+        rule_category_id: str,
+    ) -> dict[str, Any]:
+        url = (
+            f"{backend_url}/policyservice/v1/orgs/{tenant_key}/policies/{quote(policy_id, safe='')}"
+            f"/rule_configs/rules/{quote(rule_id, safe='')}"
+            f"?rule_category_id={quote(rule_category_id, safe='')}"
+        )
+        try:
+            data = self._get(url).json()
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return {}
+            raise
+        return data if isinstance(data, dict) else {}
+
     def get_watchlists(self, backend_url: str, tenant_key: str) -> list[dict[str, Any]]:
         endpoints = [
             f"{backend_url}/threathunter/watchlistmgr/v3/orgs/{tenant_key}/watchlists",
