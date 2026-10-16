@@ -451,6 +451,7 @@ def run_command(args: argparse.Namespace) -> int:
         summary["errors"].append(f"policy posture check failed: {exc}")
 
     alert_rule_config_names: dict[tuple[str, str], str] = {}
+    policy_rule_config_names: dict[tuple[str, str, str], str] = {}
     alert_rule_lookup_keys: set[tuple[str, str, str]] = set()
     policy_id_by_name = {
         str(policy.get("name", "")).strip().casefold(): str(
@@ -493,10 +494,16 @@ def run_command(args: argparse.Namespace) -> int:
         config_name = str(rule_config.get("rule_config_name") or rule_config.get("name", "")).strip()
         if config_name:
             alert_rule_config_names[(rule_category_id, rule_id)] = config_name
+            policy_rule_config_names[(policy_id, rule_id, rule_category_id)] = config_name
 
     alerts_check = summary["checks"].get("alerts", {})
     if alerts_check.get("status") == "ok":
-        alerts_summary = summarize_alerts(alerts, core_prevention_rule_names=alert_rule_config_names)
+        alerts_summary = summarize_alerts(
+            alerts,
+            core_prevention_rule_names=alert_rule_config_names,
+            policy_rule_config_names=policy_rule_config_names,
+            policy_ids_by_name=policy_id_by_name,
+        )
         alerts_summary["total_alerts_in_api"] = alerts_num_found
         alerts_summary["total_alerts_processed"] = len(alerts)
         alerts_check["summary"] = alerts_summary

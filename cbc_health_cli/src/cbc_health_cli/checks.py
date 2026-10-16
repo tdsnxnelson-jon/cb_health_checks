@@ -510,9 +510,29 @@ def _extract_alert_reputation(alert: dict[str, Any]) -> str:
     return ""
 
 
+def _normalize_cb_analytics_reason(reason: str) -> str:
+    identified_as = re.search(r"identified as\s+([A-Z0-9_ -]+?)(?:[.,!]|$)", reason, re.IGNORECASE)
+    if identified_as:
+        return f"Identified as {identified_as.group(1).strip().upper()}"
+    normalized_reason = re.sub(r"(?i)\b[a-z]:\\[^\s,;]+", "<path>", reason)
+    normalized_reason = re.sub(r"(?i)\b[\w.-]+\.exe\b", "<process>", normalized_reason)
+    normalized_reason = re.sub(r"\s+", " ", normalized_reason).strip().rstrip(".")
+    return normalized_reason
+
+
+def _display_cb_analytics_rule_fallback(reason: str) -> str:
+    normalized_reason = _normalize_cb_analytics_reason(reason)
+    if normalized_reason.startswith("Identified as "):
+        detection_type = normalized_reason.removeprefix("Identified as ").replace("_", " ").lower()
+        return f"Identified as {detection_type}"
+    return normalized_reason or "Unclassified CB Analytics alert"
+
+
 def summarize_alerts(
     alerts: list[dict[str, Any]],
     core_prevention_rule_names: dict[tuple[str, str], str] | None = None,
+    policy_rule_config_names: dict[tuple[str, str, str], str] | None = None,
+    policy_ids_by_name: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     total = len(alerts)
     severity_counter: Counter[str] = Counter()
@@ -522,6 +542,7 @@ def summarize_alerts(
     reputation_counter: Counter[str] = Counter()
     alerted_policy_counter: Counter[str] = Counter()
     cb_analytics_reason_counter: Counter[str] = Counter()
+    cb_analytics_policy_rule_counter: Counter[tuple[str, str]] = Counter()
     intrusion_detection_counter: Counter[str] = Counter()
     core_prevention_counter: Counter[str] = Counter()
     watchlist_report_counter: Counter[str] = Counter()
@@ -546,15 +567,7 @@ def summarize_alerts(
 
         reason = str(_pick_value(a, ["reason", "report_description"], "")).strip()
         if atype.upper() == "CB_ANALYTICS" and reason:
-            identified_as = re.search(r"identified as\s+([A-Z0-9_ -]+?)(?:[.,!]|$)", reason, re.IGNORECASE)
-            if identified_as:
-                reason_type = f"Identified as {identified_as.group(1).strip().upper()}"
-            else:
-                normalized_reason = re.sub(r"(?i)\b[a-z]:\\[^\s,;]+", "<path>", reason)
-                normalized_reason = re.sub(r"(?i)\b[\w.-]+\.exe\b", "<process>", normalized_reason)
-                normalized_reason = re.sub(r"\s+", " ", normalized_reason).strip().rstrip(".")
-                reason_type = normalized_reason
-            cb_analytics_reason_counter[reason_type] += 1
+            cb_analytics_reason_counter[_normalize_cb_analytics_reason(reason)] += 1
 
         rule_category_id = str(_pick_value(a, ["rule_category_id"], "")).strip()
         rule_id = str(_pick_value(a, ["rule_id"], "")).strip()
@@ -564,6 +577,17 @@ def summarize_alerts(
                 reason_category_id, reason_rule_id = reason_code.split(":", 1)
                 rule_category_id = rule_category_id or reason_category_id.strip()
                 rule_id = rule_id or reason_rule_id.strip()
+
+        if atype.upper() == "CB_ANALYTICS" and rule_id and rule_category_id:
+            policy_id = str(_pick_value(a, ["policy_id"], "")).strip()
+            if not policy_id and policy_name:
+                policy_id = (policy_ids_by_name or {}).get(policy_name.casefold(), "")
+            policy_label = policy_name or policy_id or "Unknown policy"
+            rule_name = (policy_rule_config_names or {}).get((policy_id, rule_id, rule_category_id), "")
+            if not rule_name:
+                rule_name = _display_cb_analytics_rule_fallback(reason)
+            cb_analytics_policy_rule_counter[(policy_label, rule_name)] += 1
+
         core_rule_name = (core_prevention_rule_names or {}).get((rule_category_id, rule_id), "")
         if core_rule_name in core_prevention_names:
             core_prevention_counter[core_rule_name] += 1
@@ -605,6 +629,10 @@ def summarize_alerts(
         "reputation_breakdown": dict(reputation_counter.most_common(10)),
         "top_alerted_policies": dict(alerted_policy_counter.most_common(10)),
         "top_cb_analytics_alert_types": dict(cb_analytics_reason_counter.most_common(10)),
+        "top_cb_analytics_policy_rule_blocks": [
+            {"policy": policy, "rule_block": rule_block, "count": count}
+            for (policy, rule_block), count in cb_analytics_policy_rule_counter.most_common(10)
+        ],
         "top_intrusion_detection_alerts": dict(intrusion_detection_counter.most_common(10)),
         "top_core_prevention_alert_rules": dict(core_prevention_counter.most_common(10)),
         "top_watchlist_reports": dict(watchlist_report_counter.most_common(10)),

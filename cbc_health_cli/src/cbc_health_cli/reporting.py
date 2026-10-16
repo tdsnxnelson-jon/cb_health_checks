@@ -791,30 +791,39 @@ def _add_ranking_table(
     top: float,
     width: float,
     max_height: float,
-    items: list[tuple[str, float]],
+    items: list[tuple[Any, ...]],
     *,
     font_size: float = 8,
+    column_headers: tuple[str, ...] | None = None,
+    column_widths: tuple[float, ...] | None = None,
 ) -> Any:
-    rows = [[f"{rank}. {name}", _format_count(value)] for rank, (name, value) in enumerate(items, start=1)]
+    if column_headers:
+        rows = [[*item[:-1], _format_count(item[-1])] for item in items]
+        headers = column_headers
+        resolved_column_widths = list(column_widths or [width / len(headers)] * len(headers))
+    else:
+        rows = [[f"{rank}. {name}", _format_count(value)] for rank, (name, value) in enumerate(items, start=1)]
+        headers = ("Alert / Report", "Count")
+        count_width = min(0.82, width * 0.2)
+        resolved_column_widths = [width - count_width, count_width]
     if not rows:
-        rows = [["No matching alerts", "0"]]
+        rows = [["No matching alerts", *("" for _ in headers[2:]), "0"]]
 
     table_shape = slide.shapes.add_table(
         len(rows) + 1,
-        2,
+        len(headers),
         Inches(left),
         Inches(top),
         Inches(width),
         Inches(max_height),
     )
     table = table_shape.table
-    count_width = min(0.82, width * 0.2)
-    table.columns[1].width = Inches(count_width)
-    table.columns[0].width = Inches(width - count_width)
+    for column, column_width in zip(table.columns, resolved_column_widths):
+        column.width = Inches(column_width)
 
     header_height = 0.28
     table.rows[0].height = Inches(header_height)
-    for col_index, header in enumerate(("Alert / Report", "Count")):
+    for col_index, header in enumerate(headers):
         cell = table.cell(0, col_index)
         cell.text = header
         cell.margin_left = Pt(4)
@@ -834,12 +843,13 @@ def _add_ranking_table(
                 run.font.name = "Aptos"
                 run.font.color.rgb = _hex_color("FFFFFF")
 
-    label_width_points = max((width - count_width) * 72 - 12, 40)
-    chars_per_line = max(int(label_width_points / (font_size * 0.52)), 18)
     row_heights: list[float] = []
     for row_values in rows:
-        label = row_values[0]
-        line_count = max(1, (len(label) + chars_per_line - 1) // chars_per_line)
+        line_count = max(
+            max(1, (len(str(value)) + max(int((column_width * 72 - 12) / (font_size * 0.52)), 18) - 1)
+                // max(int((column_width * 72 - 12) / (font_size * 0.52)), 18))
+            for value, column_width in zip(row_values[:-1], resolved_column_widths[:-1])
+        )
         row_heights.append(max(0.22, (font_size * 1.25 / 72 * line_count) + 0.04))
 
     available_body_height = max(max_height - header_height, 0.2)
@@ -859,7 +869,7 @@ def _add_ranking_table(
             cell.margin_bottom = Pt(1)
             cell.vertical_anchor = MSO_VERTICAL_ANCHOR.MIDDLE
             for paragraph in cell.text_frame.paragraphs:
-                paragraph.alignment = PP_ALIGN.LEFT if col_index == 0 else PP_ALIGN.CENTER
+                paragraph.alignment = PP_ALIGN.LEFT if col_index < len(row_values) - 1 else PP_ALIGN.CENTER
                 paragraph.space_before = Pt(0)
                 paragraph.space_after = Pt(0)
                 for run in paragraph.runs:
@@ -2882,10 +2892,10 @@ def write_technical_pptx(run_dir: Path) -> Path:
 
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     _add_background(slide, "FFFFFF")
-    _add_section_header(slide, "Alert Analysis", "Top alerted policies and normalized CB Analytics reasons.")
+    _add_section_header(slide, "Alert Analysis", "Top alerted policies and CB Analytics policy rule blocks.")
     alert_analysis_panels = [
         ("Top 10 Alerted Policies", "top_alerted_policies", 0.65, 5.95),
-        ("Top 10 CB Analytics Alert Types", "top_cb_analytics_alert_types", 6.75, 5.95),
+        ("Top 10 Policy Rule Blocks", "top_cb_analytics_policy_rule_blocks", 6.75, 5.95),
     ]
     for panel_title, summary_key, left, width in alert_analysis_panels:
         _add_textbox(
@@ -2899,6 +2909,30 @@ def write_technical_pptx(run_dir: Path) -> Path:
             bold=True,
             color=_hex_color("102033"),
         )
+        if summary_key == "top_cb_analytics_policy_rule_blocks":
+            raw_items = alerts.get(summary_key, [])
+            if isinstance(raw_items, dict):
+                ranking_items = []
+                for label, count in raw_items.items():
+                    policy, separator, rule_block = str(label).partition(" | ")
+                    ranking_items.append((policy if separator else "Unknown policy", rule_block if separator else policy, count))
+            else:
+                ranking_items = [
+                    (str(item.get("policy", "Unknown policy")), str(item.get("rule_block", "")), item.get("count", 0))
+                    for item in raw_items
+                    if isinstance(item, dict)
+                ]
+            _add_ranking_table(
+                slide,
+                left,
+                1.72,
+                width,
+                5.3,
+                ranking_items,
+                column_headers=("Policy", "Rule Block", "Count"),
+                column_widths=(1.55, 3.55, 0.85),
+            )
+            continue
         _add_ranking_table(
             slide,
             left,
